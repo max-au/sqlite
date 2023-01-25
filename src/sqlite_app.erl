@@ -1,0 +1,18 @@
+%%%-------------------------------------------------------------------
+%% @doc sqlite public API
+%% @end
+%%%-------------------------------------------------------------------
+
+-module(sqlite_app).
+
+-behaviour(application).
+
+-export([start/2, stop/1]).
+
+start(_StartType, _StartArgs) ->
+    sqlite_sup:start_link().
+
+stop(_State) ->
+    ok.
+
+%% internal functions
