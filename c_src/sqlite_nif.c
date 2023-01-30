@@ -1,11 +1,25 @@
+/* Code conventions:
+ *   am_XXXXXX - static (NIF-wide) atoms
+ *   s_        - static NIF-wide data
+ */
+
 #include <string.h>
-
 #include <erl_nif.h>
-
 #include <sqlite3.h>
 
 /* Not imported from erl_nif.h */
 #define THE_NON_VALUE	0
+
+/* import from ERTS */
+void erl_assert_error(const char* expr, const char* func, const char* file, int line);
+#define ASSERT_ALLOC(e) ((void) ((e) ? 1 : (erl_assert_error(#e, __func__, __FILE__, __LINE__), 0)))
+
+#ifndef NDEBUG
+#  define ASSERT(e) ((void) ((e) ? 1 : (erl_assert_error(#e, __func__, __FILE__, __LINE__), 0)))
+#else
+#  define ASSERT(e) ((void) 1)
+#endif
+
 
 /* Atom definitions (atoms cannot change dynamically) */
 static ERL_NIF_TERM am_ok;
@@ -25,6 +39,7 @@ static ERL_NIF_TERM am_read_only;
 static ERL_NIF_TERM am_read_write;
 static ERL_NIF_TERM am_read_write_create;
 static ERL_NIF_TERM am_in_memory;
+static ERL_NIF_TERM am_busy_timeout;
 
 /* atoms for notifications */
 static ERL_NIF_TERM am_insert;
@@ -60,40 +75,108 @@ static ERL_NIF_TERM am_memory_used;
 static ERL_NIF_TERM am_page_cache;
 static ERL_NIF_TERM am_malloc;
 
-/* Resources: connection */
-static ErlNifResourceType *sqlite_connection_resource;
+typedef struct statement_t statement_t;
+typedef struct delayed_close_t delayed_close_t;
 
-/* connection is not using any mutex or other way to
- * synchronise access, relying on SQLite to do that
- */
+/* prepared statement: stored as a part of connection */
+struct statement_t {
+    sqlite3_stmt* statement;
+    int released;               /* non-zero if it was GCed */
+    statement_t* next;
+};
+
+/* Use NIF-provided mutex for lock contention debugging simplicity */
 typedef struct {
     sqlite3* connection;
-    ErlNifPid tracer;
-    ERL_NIF_TERM ref;
+    ErlNifMutex* mutex;
+    ErlNifPid tracer; /* used to trace insert/delete/update ROWID */
+    ERL_NIF_TERM ref; /* sent to the tracer process */
+    ErlNifMutex* stmt_mutex;    /* mutex protecting the statements list */
+    statement_t* statements;    /* list of all statements for this connection */
 } connection_t;
 
-static void sqlite_connection_destroy(ErlNifEnv *env, void *arg)
-{
+/* resources: connection and connection-to-deallocate */
+static ErlNifResourceType *s_connection_resource;
+/* delayed deallocation process */
+static ErlNifPid s_delayed_close_pid;
+
+struct delayed_close_t {
+    sqlite3* connection;
+    statement_t* statements;    /* list of all statements for this connection */
+    delayed_close_t* next;
+};
+
+/* queue of connections to delete */
+static delayed_close_t* s_delayed_close_queue;
+/* mutex protexting the queue (could be done lockless, but there is no sense in it) */
+static ErlNifMutex* s_delayed_close_mutex;
+
+static void sqlite_connection_destroy(ErlNifEnv *env, void *arg) {
     connection_t *conn = (connection_t*)arg;
-    /* ignore SQLITE_MISUSE or any other error code */
-    sqlite3_close_v2(conn->connection);
+    
+    /* there is no need in locking the connection structure, it's guaranteed 
+    to be the very last instance */
+    if (conn->connection) {
+        /* can get here only if no explicit close/1 call was successful */
+        /* cannot do file operations in a normal scheduler */
+        delayed_close_t* node = enif_alloc(sizeof(delayed_close_t));
+        node->connection = conn->connection;
+        node->statements = conn->statements;
+        enif_mutex_lock(s_delayed_close_mutex);
+        node->next = s_delayed_close_queue;
+        s_delayed_close_queue = node;
+        enif_mutex_unlock(s_delayed_close_mutex);
+        /* notify garbage collection process */
+        enif_send(env, &s_delayed_close_pid, NULL, am_undefined);
+    } else {
+        /* explicit close/1 happened before, so just free the memory */
+        statement_t* next = conn->statements;
+        statement_t* freed;
+        while (next) {
+            freed = next;
+            next = next->next;
+            enif_free(freed);
+        }
+    }
+        
+    enif_mutex_destroy(conn->mutex);
+    enif_mutex_destroy(conn->stmt_mutex);
 }
 
-/* Resources: statement */
-static ErlNifResourceType *sqlite_statement_resource;
+/* Prepared statement. Has a weak link to the connection it belongs to.
+If the connection is closed (either implicitly via GC, or explicitly
+via close/1 call), all prepared statements are no longer valid.
+*/
+static ErlNifResourceType *s_statement_resource;
 
 typedef struct {
-    sqlite3_stmt* statement;
     connection_t* connection;
-} statement_t;
+    statement_t* reference;
+} statement_resource_t;
 
-static void sqlite_statement_destroy(ErlNifEnv *env, void *arg)
-{
-    statement_t *stmt = (statement_t*)arg;
-    sqlite3_finalize(stmt->statement);
+/*
+
+Prepared statement management is tricky. Any operation with the statement
+(prepare, finalize, or step) requires exclusive connection object ownership.
+Therefore all these operations must happen within a dirty NIF, and not
+as a part of a normal scheduler. When GC collects a statement, instead of
+finalising it in place, just mark it 'released'. GC callback cannot take
+the connection mutex! As otherwise it'd be stuck behind dirty NIFs, leading
+to a deadlock.
+
+Using SERIALIZED sqlite mode does not help: it simply wraps all operations
+(including sqlite3_bind_xxx) with connection mutex. In theory it allows
+multiple NIFs to interleave argument binding.
+*/
+
+static void sqlite_statement_destroy(ErlNifEnv *env, void *arg) {
+    statement_resource_t *stmt = (statement_resource_t*)arg;
+    stmt->reference->released = 1; /* race condition: barrier needed */
     enif_release_resource(stmt->connection);
 }
 
+
+/* Helper functions (creating binaries and errors) */
 static ERL_NIF_TERM make_binary(ErlNifEnv *env, const char* str, unsigned int len) {
     ErlNifBinary bin;
     if (!enif_alloc_binary(len, &bin))
@@ -147,11 +230,11 @@ static ERL_NIF_TERM make_sqlite_error(ErlNifEnv *env, int sqlite_error, const ch
 /* Connection (opens the database) */
 static ERL_NIF_TERM sqlite_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-    connection_t *conn;
     char *filename;
     ErlNifBinary fn_bin;
     ERL_NIF_TERM mode;
     int v2flags = 0;
+    long busy_timeout = -1;
 
     /* type checks */
     if (!enif_is_map(env, argv[1]))
@@ -171,7 +254,12 @@ static ERL_NIF_TERM sqlite_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     } else
         v2flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE; /* default mode */
 
-    mode |= SQLITE_OPEN_EXRESCODE;
+    v2flags |= SQLITE_OPEN_EXRESCODE;
+
+    if (enif_get_map_value(env, argv[1], am_busy_timeout, &mode)) {
+        if (!enif_get_int64(env, mode, &busy_timeout))
+            return make_extended_error(env, am_badarg, NULL, 2, "invalid busy timeout");
+    }
 
     /* try filename as binary */
     if (enif_inspect_iolist_as_binary(env, argv[0], &fn_bin)) {
@@ -184,22 +272,32 @@ static ERL_NIF_TERM sqlite_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     } else
         return make_extended_error(env, am_badarg, NULL, 1, "invalid file name");
 
+    /* Open the database. */
+    sqlite3* sqlite;
+    int ret = sqlite3_open_v2(filename, &sqlite, v2flags, NULL);
+    enif_free(filename);
+    if (ret != SQLITE_OK) {
+        if (sqlite)
+            sqlite3_close(sqlite); /* non-v2 used because no statement could be there */
+        return make_sqlite_error(env, ret, "error opening connection");
+    }
+
+    /* set busy timeout */
+    if (busy_timeout != -1)
+        sqlite3_busy_timeout(sqlite, busy_timeout);
+
     /* Initialize the resource */
-    conn = enif_alloc_resource(sqlite_connection_resource, sizeof(connection_t));
+    connection_t* conn = enif_alloc_resource(s_connection_resource, sizeof(connection_t));
     if (!conn) {
-        enif_free(filename);
+        sqlite3_close(sqlite);
         return enif_raise_exception(env, am_out_of_memory);
     }
 
-     /* Open the database. */
-    int ret = sqlite3_open_v2(filename, &conn->connection, v2flags, NULL);
-    enif_free(filename);
-    if (ret != SQLITE_OK) {
-        if (conn->connection)
-            sqlite3_close_v2(conn->connection);
-        enif_release_resource(conn);
-        return make_sqlite_error(env, ret, "error opening connection");
-    }
+    enif_set_pid_undefined(&conn->tracer);
+    conn->connection = sqlite;
+    conn->statements = NULL;
+    conn->mutex = enif_mutex_create("sqlite3_connection");
+    conn->stmt_mutex = enif_mutex_create("sqlite3_statement");
 
     ERL_NIF_TERM connection = enif_make_resource(env, conn);
     enif_release_resource(conn);
@@ -210,24 +308,101 @@ static ERL_NIF_TERM sqlite_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 static ERL_NIF_TERM sqlite_close_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     connection_t *conn;
-    int ret;
+    sqlite3* sqlite_db;
+    statement_t* open;
 
-    if (!enif_get_resource(env, argv[0], sqlite_connection_resource, (void **) &conn))
+    if (!enif_get_resource(env, argv[0], s_connection_resource, (void **) &conn))
         return make_extended_error(env, am_badarg, NULL, 1, "not a connection reference");
 
-    /* sqlite3_close_v2 fails if transaction is in progress */
-    if (!sqlite3_get_autocommit(conn->connection)) {
-        ret = sqlite3_exec(conn->connection, "ROLLBACK;", NULL, NULL, NULL);
-        if (ret != SQLITE_OK)
-            return make_sqlite_error(env, ret, "unable to rollback current transaction");
+    enif_mutex_lock(conn->mutex);
+    if (conn->connection) {
+        sqlite_db = conn->connection;
+        conn->connection = NULL;
+    } else {
+        enif_mutex_unlock(conn->mutex);
+        return make_extended_error(env, am_badarg, NULL, 1, "connection already closed");
     }
 
-    ret = sqlite3_close_v2(conn->connection);
-    if (ret == SQLITE_MISUSE)
-        return make_extended_error(env, am_badarg, NULL, 1, "connection already closed");
-    if (ret != SQLITE_OK)
-        return make_sqlite_error(env, ret, "error closing connection");
+    enif_mutex_unlock(conn->mutex);
 
+    /* iterate over all statements, removing sqlite3_stmt */
+    statement_t* freed;
+    statement_t** prev;
+    int count = 0;
+    enif_mutex_lock(conn->stmt_mutex);
+
+    /* count all statements */
+    open = conn->statements;
+    while (open) {
+        count++;
+        open = open->next;
+    }
+
+    /* allocate memory to move sqlite3_stmt */
+    sqlite3_stmt* final[count]; /* once again, FIXME: do not use this C99 feature! */
+
+    open = conn->statements;
+    prev = &conn->statements;
+    count = 0;
+    while (open) {
+        final[count] = open->statement;
+        if (open->released) {
+            freed = open;
+            open = open->next;
+            /* remove the entire statement*/
+            enif_free(freed);
+            *prev = open;
+        } else {
+            /* keep the statement */
+            open->statement = NULL;
+            prev = &open->next;
+            open = open->next;
+        }
+        count++;
+    }
+    enif_mutex_unlock(conn->stmt_mutex);
+
+    enif_mutex_lock(conn->mutex);
+
+    /* finalize everything moved */
+    for (int i=0; i<count; i++)
+        sqlite3_finalize(final[i]);
+
+    /* close the connection, there must not be any statements left */
+    int ret = sqlite3_close(sqlite_db);
+    ASSERT(ret == SQLITE_OK);
+
+    enif_mutex_unlock(conn->mutex);
+
+    return am_ok;
+}
+
+/* This function should only be called from a "cleanup" process that owns orphan connections
+ * that weren't closed explicitly. Ideally it should not ever be called. */
+static ERL_NIF_TERM sqlite_dirty_close_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    delayed_close_t* next;
+
+    /* iterate over pending connections */
+    enif_mutex_lock(s_delayed_close_mutex);
+    ASSERT(s_delayed_close_queue);
+    next = s_delayed_close_queue;
+    s_delayed_close_queue = next->next;
+    enif_mutex_unlock(s_delayed_close_mutex);
+
+    /* it's guaranteed that no statements are used here, so just finalize all of them */
+    statement_t* stmt = next->statements;
+    statement_t* freed;
+    while (stmt) {
+        if (stmt->statement)
+            sqlite3_finalize(stmt->statement);
+        freed = stmt;
+        stmt = stmt->next;
+        enif_free(freed);
+    }
+    int ret = sqlite3_close(next->connection);
+    ASSERT(ret == SQLITE_OK);
+    enif_free(next);
     return am_ok;
 }
 
@@ -245,11 +420,14 @@ static ERL_NIF_TERM sqlite_status_nif(ErlNifEnv *env, int argc, const ERL_NIF_TE
 {
     connection_t *conn;
 
-    if (!enif_get_resource(env, argv[0], sqlite_connection_resource, (void **) &conn))
+    if (!enif_get_resource(env, argv[0], s_connection_resource, (void **) &conn))
         return make_extended_error(env, am_badarg, NULL, 1, "not a connection reference");
 
-    if (conn->connection == NULL)
+    enif_mutex_lock(conn->mutex);
+    if (conn->connection == NULL) {
+        enif_mutex_unlock(conn->mutex);
         return make_extended_error(env, am_badarg, NULL, 1, "connection closed");
+    }
 
     ERL_NIF_TERM status = enif_make_new_map(env);
     ERL_NIF_TERM lookaside = enif_make_new_map(env);
@@ -285,28 +463,9 @@ static ERL_NIF_TERM sqlite_status_nif(ErlNifEnv *env, int argc, const ERL_NIF_TE
     enif_make_map_put(env, status, am_lookaside, lookaside, &status);
     enif_make_map_put(env, status, am_cache, cache, &status);
 
+    enif_mutex_unlock(conn->mutex);
+
     return status;
-}
-
-/* internal function to prepare a new statement */
-static ERL_NIF_TERM prepare(ErlNifEnv *env, ERL_NIF_TERM connection, ERL_NIF_TERM query, statement_t* stmt) {
-    connection_t *conn;
-
-    if (!enif_get_resource(env, connection, sqlite_connection_resource, (void **) &conn))
-        return make_extended_error(env, am_badarg, NULL, 1, "not a connection reference");
-
-    ErlNifBinary query_bin;
-    if (!enif_inspect_iolist_as_binary(env, query, &query_bin))
-        return make_extended_error(env, am_badarg, NULL, 2, "not an iolist");
-
-    int ret = sqlite3_prepare_v2(conn->connection, (char*)query_bin.data, query_bin.size, &stmt->statement, NULL);
-    if (ret != SQLITE_OK)
-        return make_sqlite_error(env, ret, "error preparing statement");
-
-    enif_keep_resource(conn);
-    stmt->connection = conn;
-
-    return THE_NON_VALUE;
 }
 
 /* bind & execute */
@@ -316,6 +475,7 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
     ErlNifBinary bin;
     ERL_NIF_TERM param, result;
     int ret, column = 1;
+    int expected = sqlite3_bind_parameter_count(stmt);
 
     /* bind arguments passed */
     while (!enif_is_empty_list(env, params)) {
@@ -336,10 +496,12 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
             } else if (enif_get_double(env, param, &double_val))
                 ret = sqlite3_bind_double(stmt, column, double_val);
             else {
-                ret = -1; /* TODO: implement better error reporting */
+                return make_extended_error_ex(env, am_badarg, "bignum not supported", 20, NULL, 
+                    enif_make_tuple2(env, make_binary(env, "failed to bind argument", 23), enif_make_int(env, column)));
             }
         } else {
-            ret = -1;
+            return make_extended_error_ex(env, am_badarg, "unsupported type", 16, NULL, 
+                enif_make_tuple2(env, make_binary(env, "failed to bind argument", 23), enif_make_int(env, column)));
         }
 
         if (ret != SQLITE_OK) {
@@ -352,6 +514,9 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
         column++;
     }
 
+    if (column <= expected) 
+        return make_extended_error(env, am_badarg, NULL, 2, "not enough arguments");
+
     /* run the query */
     ret = sqlite3_step(stmt);
     switch (ret) {
@@ -362,8 +527,7 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
             result = enif_make_list(env, 0);
             do {
                 int column_count = sqlite3_column_count(stmt);
-                int column_type, int_val;
-                double double_val;
+                int column_type;
                 unsigned int size;
                 ERL_NIF_TERM row;
                 ERL_NIF_TERM values[column_count]; /* C99 supports this, but it's discouraged, maybe use enif_alloc? */
@@ -371,7 +535,7 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
                     column_type = sqlite3_column_type(stmt, i);
                     switch (column_type) {
                         case SQLITE_NULL:
-                            result = values[i] = am_undefined;
+                            values[i] = am_undefined;
                             break;
                         case SQLITE_BLOB:
                             size = sqlite3_column_bytes(stmt, i);
@@ -413,32 +577,70 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
 /* Query preparation */
 static ERL_NIF_TERM sqlite_prepare_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-    /* Initialize the resource */
-    statement_t* statement = enif_alloc_resource(sqlite_statement_resource, sizeof(statement_t));
-    if (!statement)
-        return enif_raise_exception(env, am_out_of_memory);
+    connection_t* conn;
+    if (!enif_get_resource(env, argv[0], s_connection_resource, (void **) &conn))
+        return make_extended_error(env, am_badarg, NULL, 1, "not a connection reference");
 
-    ERL_NIF_TERM reason = prepare(env, argv[0], argv[1], statement);
-    if (reason != THE_NON_VALUE) {
-        enif_release_resource(statement);
-        return reason;
+    ErlNifBinary query_bin;
+    if (!enif_inspect_iolist_as_binary(env, argv[1], &query_bin))
+        return make_extended_error(env, am_badarg, NULL, 2, "not an iolist");
+
+    /* create a statement inside the connection */
+    statement_t* statement = enif_alloc(sizeof(statement_t));
+    ASSERT_ALLOC(statement);
+    statement->released = 0;
+
+    /* Initialize the resource */
+    statement_resource_t* stmt_res = enif_alloc_resource(s_statement_resource, sizeof(statement_resource_t));
+    ASSERT_ALLOC(stmt_res);
+    stmt_res->connection = conn;
+    stmt_res->reference = statement;
+
+    sqlite3_stmt* stmt;
+
+    enif_mutex_lock(conn->mutex);
+    if (!conn->connection) {
+        enif_mutex_unlock(conn->mutex);
+        return make_extended_error(env, am_badarg, NULL, 1, "connection closed");
     }
 
-    ERL_NIF_TERM prepared_statement = enif_make_resource(env, statement);
-    enif_release_resource(statement);
+    enif_mutex_lock(conn->stmt_mutex);
+    int ret = sqlite3_prepare_v2(conn->connection, (char*)query_bin.data, query_bin.size, &stmt, NULL);
+    if (ret != SQLITE_OK) {
+        enif_mutex_unlock(conn->stmt_mutex);
+        enif_mutex_unlock(conn->mutex);
+        return make_sqlite_error(env, ret, "error preparing statement");
+    }
 
-    return prepared_statement;
+    statement->statement = stmt;
+    statement->next = conn->statements;
+    conn->statements = statement;
+    enif_mutex_unlock(conn->stmt_mutex);
+
+    enif_mutex_unlock(conn->mutex);
+
+    enif_keep_resource(conn);
+    
+    ERL_NIF_TERM stmt_res_term = enif_make_resource(env, stmt_res);
+    enif_release_resource(stmt_res);
+
+    return stmt_res_term;
 }
 
-#define statement_stat(op, atom) enif_make_map_put(env, status, atom, enif_make_int64(env, sqlite3_stmt_status(stmt->statement, op, 0)), &status);
+#define statement_stat(op, atom) enif_make_map_put(env, status, atom, enif_make_int64(env, sqlite3_stmt_status(stmt, op, 0)), &status);
 
 /* Statement status */
 static ERL_NIF_TERM sqlite_info_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-    statement_t* stmt;
+    statement_resource_t* stmt_res;
 
-    if (!enif_get_resource(env, argv[0], sqlite_statement_resource, (void **) &stmt))
+    if (!enif_get_resource(env, argv[0], s_statement_resource, (void **) &stmt_res))
         return make_extended_error(env, am_badarg, NULL, 1, "not a prepared statement");
+
+    /* close/1 may wipe the statement out, so take a lock */
+    enif_mutex_lock(stmt_res->connection->mutex);
+
+    sqlite3_stmt* stmt = stmt_res->reference->statement;
 
     ERL_NIF_TERM status = enif_make_new_map(env);
     statement_stat(SQLITE_STMTSTATUS_FULLSCAN_STEP, am_fullscan_step);
@@ -451,42 +653,59 @@ static ERL_NIF_TERM sqlite_info_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     statement_stat(SQLITE_STMTSTATUS_FILTER_HIT, am_filter_hit); */
     statement_stat(SQLITE_STMTSTATUS_MEMUSED, am_memory_used);
 
+    enif_mutex_unlock(stmt_res->connection->mutex);
     return status;
 }
 
 /* Query execution */
 static ERL_NIF_TERM sqlite_execute_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-    statement_t* stmt;
+    statement_resource_t* stmt;
 
-    if (!enif_get_resource(env, argv[0], sqlite_statement_resource, (void **) &stmt))
+    if (!enif_get_resource(env, argv[0], s_statement_resource, (void **) &stmt))
         return make_extended_error(env, am_badarg, NULL, 1, "not a prepared statement");
 
-    int ret = sqlite3_reset(stmt->statement);
-    if (ret != SQLITE_OK)
-        return make_sqlite_error(env, ret, "error resetting statement");
+    enif_mutex_lock(stmt->connection->mutex);
+    if (!stmt->connection->connection) {
+        enif_mutex_unlock(stmt->connection->mutex);
+        return make_extended_error(env, am_badarg, NULL, 1, "connection closed");
+    }
 
-    return bind_and_execute(env, stmt->statement, argv[1]);
+    int ret = sqlite3_reset(stmt->reference->statement);
+    if (ret != SQLITE_OK) {
+        enif_mutex_unlock(stmt->connection->mutex);
+        return make_sqlite_error(env, ret, "error resetting statement");
+    }
+
+    ERL_NIF_TERM result = bind_and_execute(env, stmt->reference->statement, argv[1]);
+    enif_mutex_unlock(stmt->connection->mutex);
+    return result;
 }
 
 static ERL_NIF_TERM sqlite_describe_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-    statement_t* stmt;
+    statement_resource_t* stmt_res;
     int count;
     const char* name;
     const char* type;
     ERL_NIF_TERM columns, name_bin, type_bin;
 
-    if (!enif_get_resource(env, argv[0], sqlite_statement_resource, (void **) &stmt))
+    if (!enif_get_resource(env, argv[0], s_statement_resource, (void **) &stmt_res))
         return make_extended_error(env, am_badarg, NULL, 1, "not a prepared statement");
 
-    count = sqlite3_column_count(stmt->statement);
+    enif_mutex_lock(stmt_res->connection->mutex);
+    if (!stmt_res->connection->connection) {
+        enif_mutex_unlock(stmt_res->connection->mutex);
+        return make_extended_error(env, am_badarg, NULL, 1, "connection closed");
+    }
+
+    count = sqlite3_column_count(stmt_res->reference->statement);
 
     columns = enif_make_list(env, 0);
 
     for(int i=count-1; i>=0; i--) {
-        name = sqlite3_column_name(stmt->statement, i);
-        type = sqlite3_column_decltype(stmt->statement, i);
+        name = sqlite3_column_name(stmt_res->reference->statement, i);
+        type = sqlite3_column_decltype(stmt_res->reference->statement, i);
         if (name && !type)
             return enif_raise_exception(env, am_out_of_memory);
         name_bin = make_binary(env, name, strlen(name));
@@ -494,25 +713,31 @@ static ERL_NIF_TERM sqlite_describe_nif(ErlNifEnv *env, int argc, const ERL_NIF_
         columns = enif_make_list_cell(env, enif_make_tuple2(env, name_bin, type_bin), columns);
     }
 
+    enif_mutex_unlock(stmt_res->connection->mutex);
+
     return columns;
 }
 
 /* Combined preparation and execution */
 static ERL_NIF_TERM sqlite_query_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-    statement_t stmt;
-    /* create a new throw-away statement that's not accounted as a resource */
-    ERL_NIF_TERM reason = prepare(env, argv[0], argv[1], &stmt);
+    connection_t* conn;
+    if (!enif_get_resource(env, argv[0], s_connection_resource, (void **) &conn))
+        return make_extended_error(env, am_badarg, NULL, 1, "not a connection reference");
 
-    /* after this, ensure no extra returns can happen without freeing the stmt */
-    if (reason != THE_NON_VALUE)
-        return reason;
+    ErlNifBinary query_bin;
+    if (!enif_inspect_iolist_as_binary(env, argv[1], &query_bin))
+        return make_extended_error(env, am_badarg, NULL, 2, "not an iolist");
 
-    ERL_NIF_TERM result = bind_and_execute(env, stmt.statement, argv[2]);
+    sqlite3_stmt* stmt;
+    int ret = sqlite3_prepare_v2(conn->connection, (char*)query_bin.data, query_bin.size, &stmt, NULL);
+    if (ret != SQLITE_OK)
+        return make_sqlite_error(env, ret, "error preparing statement");
+
+    ERL_NIF_TERM result = bind_and_execute(env, stmt, argv[2]);
 
     /* cleanup */
-    sqlite3_finalize(stmt.statement);
-    enif_release_resource(stmt.connection);
+    sqlite3_finalize(stmt);
 
     return result;
 }
@@ -520,7 +745,7 @@ static ERL_NIF_TERM sqlite_query_nif(ErlNifEnv *env, int argc, const ERL_NIF_TER
 static void update_callback(void *arg, int op_type, char const *db, char const *table, sqlite3_int64 rowid)
 {
     connection_t *conn = (connection_t *)arg;
-    if (!conn)
+    if (!conn || enif_is_pid_undefined(&conn->tracer))
         return;
 
     ERL_NIF_TERM op;
@@ -559,7 +784,7 @@ static void update_callback(void *arg, int op_type, char const *db, char const *
 /* Connection monitoring */
 static ERL_NIF_TERM sqlite_monitor_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     connection_t* conn;
-    if(!enif_get_resource(env, argv[0], sqlite_connection_resource, (void **) &conn))
+    if(!enif_get_resource(env, argv[0], s_connection_resource, (void **) &conn))
         return make_extended_error(env, am_badarg, NULL, 1, "not a connection reference");
 
     if (argv[1] == am_undefined)
@@ -578,7 +803,7 @@ static ERL_NIF_TERM sqlite_monitor_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
 
 static ERL_NIF_TERM sqlite_interrupt_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     connection_t* conn;
-    if(!enif_get_resource(env, argv[0], sqlite_connection_resource, (void **) &conn))
+    if(!enif_get_resource(env, argv[0], s_connection_resource, (void **) &conn))
         return make_extended_error(env, am_badarg, NULL, 1, "not a connection reference");
 
     sqlite3_interrupt(conn->connection);
@@ -615,7 +840,7 @@ static ERL_NIF_TERM sqlite_system_info_nif(ErlNifEnv *env, int argc, const ERL_N
 static ERL_NIF_TERM sqlite_get_last_insert_rowid_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     connection_t* conn;
-    if(!enif_get_resource(env, argv[0], sqlite_connection_resource, (void **) &conn))
+    if(!enif_get_resource(env, argv[0], s_connection_resource, (void **) &conn))
         return make_extended_error(env, am_badarg, NULL, 1, "not a connection reference");
     sqlite3_interrupt(conn->connection);
     return enif_make_int64(env, sqlite3_last_insert_rowid(conn->connection));
@@ -624,60 +849,86 @@ static ERL_NIF_TERM sqlite_get_last_insert_rowid_nif(ErlNifEnv *env, int argc, c
 
 /* NIF Exports */
 static ErlNifFunc nif_funcs[] = {
-    {"sqlite_open_nif", 2, sqlite_open_nif},
-    {"sqlite_close_nif", 1, sqlite_close_nif},
-    {"sqlite_status_nif", 1, sqlite_status_nif},
-    {"sqlite_query_nif", 3, sqlite_query_nif},
-    {"sqlite_prepare_nif", 2, sqlite_prepare_nif},
-    {"sqlite_info_nif", 1, sqlite_info_nif},
-    {"sqlite_describe_nif", 1, sqlite_describe_nif},
-    {"sqlite_execute_nif", 2, sqlite_execute_nif},
-    {"sqlite_monitor_nif", 2, sqlite_monitor_nif},
-    {"sqlite_interrupt_nif", 1, sqlite_interrupt_nif},
+    {"sqlite_open_nif", 2, sqlite_open_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_close_nif", 1, sqlite_close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_status_nif", 1, sqlite_status_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_query_nif", 3, sqlite_query_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_prepare_nif", 2, sqlite_prepare_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_info_nif", 1, sqlite_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_describe_nif", 1, sqlite_describe_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_execute_nif", 2, sqlite_execute_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_monitor_nif", 2, sqlite_monitor_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_interrupt_nif", 1, sqlite_interrupt_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"sqlite_system_info_nif", 0, sqlite_system_info_nif},
-    {"sqlite_get_last_insert_rowid_nif", 1, sqlite_get_last_insert_rowid_nif}
+    {"sqlite_get_last_insert_rowid_nif", 1, sqlite_get_last_insert_rowid_nif},
+
+    {"sqlite_dirty_close_nif", 0, sqlite_dirty_close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 
 
 /* memory management */
 static int sqlmem_init(void*) {return 0;}
 static void sqlmem_shutdown(void*) {}
+
 static void* sqlmem_alloc(int size)
 {
-    int* alloc = (int*)enif_alloc(size + sizeof(int));
+    ErlNifSInt64* alloc = (ErlNifSInt64*)enif_alloc(size + sizeof(ErlNifSInt64));
     *alloc = size;
     return alloc + 1;
 }
 
 static void sqlmem_free(void* ptr)
 {
-    int* alloc = (int*)ptr;
+    ErlNifSInt64* alloc = (ErlNifSInt64*)ptr;
     enif_free(alloc - 1);
 }
 
 static void* sqlmem_realloc(void* ptr, int size)
 {
-    int* alloc = (int*)ptr;
-    alloc = enif_realloc(alloc - 1, size + sizeof(int));
+    ErlNifSInt64* alloc = (ErlNifSInt64*)ptr;
+    alloc = enif_realloc(alloc - 1, size + sizeof(ErlNifSInt64));
     *alloc = size;
     return alloc + 1;
 }
 
-static int sqlmem_roundup(int orig) {return (orig + 7) & (~7);}
+static int sqlmem_roundup(int orig) 
+{
+    int bit = sizeof(ErlNifSInt64) - 1;
+    return (orig + bit) & (~bit);
+}
 
 static int sqlmem_size(void* ptr)
 {
-    int* alloc = (int*)ptr;
+    ErlNifSInt64* alloc = (ErlNifSInt64*)ptr;
     return alloc[-1];
 }
 
 /* Load/unload/reload */
 static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM load_info)
 {
-    ErlNifResourceType *rt;
+    if (!enif_get_local_pid(env, load_info, &s_delayed_close_pid))
+        return -6;
 
-    if (!sqlite3_threadsafe())
+    /* configure sqlite mutex & memory allocation */
+    sqlite3_mem_methods mem;
+
+    mem.xMalloc = sqlmem_alloc;
+    mem.xFree = sqlmem_free;
+    mem.xRealloc = sqlmem_realloc;
+    mem.xRoundup = sqlmem_roundup;
+    mem.xSize = sqlmem_size;
+    mem.xInit = sqlmem_init;
+    mem.xShutdown = sqlmem_shutdown;
+
+    if (sqlite3_config(SQLITE_CONFIG_MALLOC, &mem) != SQLITE_OK)
         return -1;
+
+    /* use multi-threaded SQLite mode to enable explicit NIF mutex name */
+    if (sqlite3_config(SQLITE_CONFIG_MULTITHREAD, NULL) != SQLITE_OK)
+        return -2;
+
+    if (sqlite3_initialize() != SQLITE_OK)
+        return -3;
 
     am_ok = enif_make_atom(env, "ok");
     am_error = enif_make_atom(env, "error");
@@ -695,6 +946,7 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM load_info)
     am_read_write = enif_make_atom(env, "read_write");
     am_read_write_create = enif_make_atom(env, "read_write_create");
     am_in_memory = enif_make_atom(env, "in_memory");
+    am_busy_timeout = enif_make_atom(env, "busy_timeout");
 
     am_insert = enif_make_atom(env, "insert");
     am_update = enif_make_atom(env, "update");
@@ -729,35 +981,23 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM load_info)
     am_page_cache = enif_make_atom(env, "page_cache");
     am_malloc = enif_make_atom(env, "malloc");
 
-
-    rt = enif_open_resource_type(env, NULL, "sqlite_connection", sqlite_connection_destroy,
-        ERL_NIF_RT_CREATE, NULL);
-    if (!rt)
-        return -2;
-    sqlite_connection_resource = rt;
-
-    rt = enif_open_resource_type(env, NULL, "sqlite_statement", sqlite_statement_destroy,
-        ERL_NIF_RT_CREATE, NULL);
-    if (!rt)
-        return -3;
-    sqlite_statement_resource = rt;
-
-    /* configure sqlite mutex & memory allocation */
-    sqlite3_mem_methods mem;
-
-    mem.xMalloc = sqlmem_alloc;
-    mem.xFree = sqlmem_free;
-    mem.xRealloc = sqlmem_realloc;
-    mem.xRoundup = sqlmem_roundup;
-    mem.xSize = sqlmem_size;
-    mem.xInit = sqlmem_init;
-    mem.xShutdown = sqlmem_shutdown;
-
-    if (sqlite3_config(SQLITE_CONFIG_MALLOC, &mem) != SQLITE_OK)
+    ErlNifResourceType *rt;
+    rt = enif_open_resource_type(env, NULL, "sqlite_connection", sqlite_connection_destroy, ERL_NIF_RT_CREATE, NULL);
+    if (!rt) {
+        sqlite3_shutdown();
         return -4;
+    }
+    s_connection_resource = rt;
 
-    if (sqlite3_initialize() != SQLITE_OK)
+    rt = enif_open_resource_type(env, NULL, "sqlite_statement", sqlite_statement_destroy, ERL_NIF_RT_CREATE, NULL);
+    if (!rt) {
+        sqlite3_shutdown();
         return -5;
+    }
+    s_statement_resource = rt;
+
+    s_delayed_close_mutex = enif_mutex_create("sqlite_delayed_close");
+    s_delayed_close_queue = NULL;
 
     return 0;
 }

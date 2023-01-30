@@ -2,13 +2,17 @@
 sqlite3 NIF implementation.
 
 ## Not implemented
+* Correct dirty I/O behaviour (not blocking GC when collecting sqlite connection)
+* performance (benchmarking)
 * Types mapping
+* Concurrency tests
 * Thread safety of "connection" and "statement" objects
-* Yielding and dirty NIFs
+* Yielding
 * Online Backup support
 * Snapshot support
 * Commit and Rollback hooks support
 * Memory leaks tests
+* database serialisation (sqlite3_serialize)
 
 ## Build
 -----
@@ -19,20 +23,18 @@ sqlite3 NIF implementation.
 Following primitive types in Erlang are mapped to corresponding sqlite types:
  * binary() <-> sqlite3 blob
  * string() <-> sqlite3 text
+ * atom() <-> sqlite text
  * integer() <-> integer
  * float() <-> float
  * undefined <-> null
-
-## TODO
-Before 1.0 release, following features must be explored:
- * memory allocators done through BEAM (for accounting purposes)
- * directories (data and temp directory settings)
- * mutex methods (for lock counting purposes)
- * better testing for extended error information (not just badarg)
+ * map() <-> JSON
 
 ## Failing to load
 
 If the NIF fails with "Library load-call unsuccessful":
- * -1 sqlite3 was not built with thread safety turned on
- * -2 connection resource creation was unsuccessful
- * -3 statement resource creation failed
+* -1 fails to set memory functions
+* -2 fails to multithreading mode
+* -3 failed to initialise
+* -4 connection resource creation was unsuccessful
+* -5 statement resource creation failed
+
