@@ -31,8 +31,8 @@ else ifeq ($(UNAME_SYS), Linux)
 	CXXFLAGS ?= -O3 -finline-functions -Wall
 endif
 
-CFLAGS = -g -O1 -finline-functions -Wall -Wmissing-prototypes -std=c99
-CXXFLAGS = -g -O1 -finline-functions -Wall -Wmissing-prototypes -std=c99
+CFLAGS = -g -O1 -finline-functions -Wall -Wmissing-prototypes -std=c99 -fno-omit-frame-pointer
+CXXFLAGS = -g -O1 -finline-functions -Wall -Wmissing-prototypes -std=c99 -fno-omit-frame-pointer
 
 CFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR)
 CXXFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR)

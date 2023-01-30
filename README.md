@@ -2,17 +2,33 @@
 sqlite3 NIF implementation.
 
 ## Not implemented
-* Correct dirty I/O behaviour (not blocking GC when collecting sqlite connection)
-* performance (benchmarking)
 * Types mapping
-* Concurrency tests
-* Thread safety of "connection" and "statement" objects
-* Yielding
+* performance (benchmarking) - especially in the memory allocation
+* performance - concurrent access to the same connection/statement
+* performance - see what can run on normal scheduler (yielding?)
+* memory leaks tests
+
+Extra Features
 * Online Backup support
 * Snapshot support
 * Commit and Rollback hooks support
-* Memory leaks tests
-* database serialisation (sqlite3_serialize)
+* Database serialisation (sqlite3_serialize)
+
+## Cleanup
+* debug settings from c_src Makefile
+* sqlite amalgamation (provide with a NIF)
+* debug scripts (place somewhere?)
+
+
+## Extended error structure (cause)
+
+```erlang
+-type cause() :: #{
+    general => binary(),        %% sub-operation that failed "error opening connection"
+    detail => binary(),         %% detailed human-readable error, e.g. "missing permissions"
+    position => integer()       %% only set for preparing statements or, binding arguments, - column
+}.
+```
 
 ## Build
 -----
