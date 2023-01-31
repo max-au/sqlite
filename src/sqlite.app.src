@@ -1,15 +1,11 @@
 {application, sqlite,
- [{description, "An OTP application"},
-  {vsn, "0.1.0"},
-  {registered, []},
-  {mod, {sqlite_app, []}},
-  {applications,
-   [kernel,
-    stdlib
-   ]},
-  {env,[]},
-  {modules, []},
+    [{description, "sqlite: NIF bindings for Erlang"},
+        {vsn, "0.1.0"},
+        {registered, []},
+        {applications, [kernel, stdlib]},
+        {env, []},
+        {modules, []},
 
-  {licenses, ["Apache-2.0"]},
-  {links, []}
- ]}.
+        {licenses, ["BSD 3-clause clear"]},
+        {links, [{"GitHub", "https://github.com/max-au/sqlite"}]}
+    ]}.

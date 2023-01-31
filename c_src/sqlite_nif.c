@@ -5,7 +5,17 @@
 
 #include <string.h>
 #include <erl_nif.h>
-#include "sqlite3.h"
+
+#ifdef USE_SYSTEM_SQLITE
+#include <sqlite3.h>
+#else
+#include "./sqlite3.h"
+#endif
+
+#ifdef NO_SQLITE3_ERROR_OFFSET
+static int sqlite3_error_offset(sqlite3 *db) {return -1;}
+#endif
+
 
 /* Not imported from erl_nif.h */
 #define THE_NON_VALUE	0

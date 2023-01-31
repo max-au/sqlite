@@ -2,22 +2,26 @@
 sqlite3 NIF implementation.
 
 ## Not implemented
-* Types mapping
+* tests!
 * performance (benchmarking) - especially in the memory allocation
-* performance - concurrent access to the same connection/statement
+* performance - concurrent access to the same connection/statement (locking efficiency)
 * performance - see what can run on normal scheduler (yielding?)
 * memory leaks tests
+* tests for "garbage collector process" started with on_load, and the process shutdown
+* better/proper monitoring for ROWID changes
+* documentation
+* OS support (Linux, MacOS, Windows, FreeBSD)
 
 Extra Features
 * Online Backup support
 * Snapshot support
 * Commit and Rollback hooks support
 * Database serialisation (sqlite3_serialize)
+* Explicit Step/Bind APIs
+* More type conversions
 
 ## Cleanup
-* debug settings from c_src Makefile
-* sqlite amalgamation (provide with a NIF)
-* debug scripts (place somewhere?)
+* cleanup code from "memory assertions" and test errors (out of memory etc)
 
 
 ## Extended error structure (cause)
@@ -30,20 +34,17 @@ Extra Features
 }.
 ```
 
-## Build
------
-
-    $ rebar3 compile
-
 ## Erlang to sqlite data type mapping
 Following primitive types in Erlang are mapped to corresponding sqlite types:
  * binary() <-> sqlite3 blob
  * string() <-> sqlite3 text
- * atom() <-> sqlite text
  * integer() <-> integer
  * float() <-> float
  * undefined <-> null
- * map() <-> JSON
+
+Potentially, in the future:
+ * atom() <-> text?
+ * map() <-> JSON?
 
 ## Failing to load
 

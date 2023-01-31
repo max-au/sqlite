@@ -100,14 +100,15 @@ types(Config) when is_list(Config) ->
     [{NegativePi}, {Pi}] = sqlite:query(Conn, "SELECT f1 FROM types WHERE f1 IS NOT NULL ORDER BY f1"),
     %% null (undefined)
     %% atom (??!)
+    Unsupported = #{cause => #{details => <<"unsupported type">>, position => 1, general => <<"failed to bind argument">>}},
     %% reference/fun/pid/port/THING
-    ?assertExtended(error, badarg,
-        #{cause => #{details => <<"unsupported type">>, position => 1, general => <<"failed to bind argument">>}},
-        sqlite:execute(PreparedInt, [self()])),
+    ?assertExtended(error, badarg, Unsupported, sqlite:execute(PreparedInt, [self()])),
     %% tuple/record
+    ?assertExtended(error, badarg, Unsupported, sqlite:execute(PreparedInt, [{}])),
     %% map (JSON?)
-    %% list
-    ok.
+    ?assertExtended(error, badarg, Unsupported, sqlite:execute(PreparedInt, [#{}])),
+    %% list is a string, but not a list of large numbers
+    ?assertExtended(error, badarg, Unsupported, sqlite:execute(PreparedInt, [[12345]])).
 
 status(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{mode => in_memory}),

@@ -1,77 +1,70 @@
-# Based on c_src.mk from erlang.mk by Loic Hoguin <essen@ninenines.eu>
+# General variables
+C_SRC_DIR := $(shell pwd)
+PROJECT_DIR := $(abspath $(C_SRC_DIR)/..)
 
-CURDIR := $(shell pwd)
-BASEDIR := $(abspath $(CURDIR)/..)
+# Figure out OS-specific details: library extension
+ifeq ($(OS),Windows_NT)
+	TARGET := $(PROJECT_DIR)/priv/sqlite.dll
+else
+	TARGET := $(PROJECT_DIR)/priv/sqlite.so
+	UNAME_SYS := $(shell uname -s)
 
-PROJECT ?= $(notdir $(BASEDIR))
-PROJECT := $(strip $(PROJECT))
-
-ERTS_INCLUDE_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts/erts-~ts/include/\", [code:root_dir(), erlang:system_info(version)])." -s init stop)
-ERL_INTERFACE_INCLUDE_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts\", [code:lib_dir(erl_interface, include)])." -s init stop)
-ERL_INTERFACE_LIB_DIR ?= $(shell erl -noshell -eval "io:format(\"~ts\", [code:lib_dir(erl_interface, lib)])." -s init stop)
-
-C_SRC_DIR = $(CURDIR)
-C_SRC_OUTPUT ?= $(CURDIR)/../priv/$(PROJECT).so
-
-# System type and C compiler/flags.
-
-UNAME_SYS := $(shell uname -s)
-ifeq ($(UNAME_SYS), Darwin)
-	CC ?= cc
-	CFLAGS ?= -O3 -std=c99 -finline-functions -Wall -Wmissing-prototypes
-	CXXFLAGS ?= -O3 -finline-functions -Wall
-	LDFLAGS ?= -flat_namespace -undefined suppress
-else ifeq ($(UNAME_SYS), FreeBSD)
-	CC ?= cc
-	CFLAGS ?= -O3 -std=c99 -finline-functions -Wall -Wmissing-prototypes
-	CXXFLAGS ?= -O3 -finline-functions -Wall
-else ifeq ($(UNAME_SYS), Linux)
-	CC ?= gcc
-	CFLAGS ?= -O3 -std=c99 -finline-functions -Wall -Wmissing-prototypes
-	CXXFLAGS ?= -O3 -finline-functions -Wall
+	ifeq ($(UNAME_SYS), Darwin)
+		CC ?= cc
+		LDFLAGS ?= -flat_namespace -undefined suppress
+	else ifeq ($(UNAME_SYS), FreeBSD)
+		CC ?= cc
+	else ifeq ($(UNAME_SYS), Linux)
+		CC ?= gcc
+	endif
 endif
 
-CFLAGS = -g -O1 -finline-functions -Wall -Wmissing-prototypes -std=c99 -fno-omit-frame-pointer
-CXXFLAGS = -g -O1 -finline-functions -Wall -Wmissing-prototypes -std=c99 -fno-omit-frame-pointer
+# Figure out Erlang Library paths.
+# Do a single call to "erl" printing all the information, and split it in words later.
+# This saves quite an amount of time spawning extra BEAMs
+DIRS = $(shell erl -noshell -eval "io:format(\"~ts/erts-~ts/include/~n~ts~n~ts\", [code:root_dir(), erlang:system_info(version), code:lib_dir(erl_interface, include), code:lib_dir(erl_interface, lib)])." -s init stop)
 
-CFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR)
-CXXFLAGS += -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR)
+ERTS_INCLUDE_DIR ?= $(word 1, $(DIRS))
+ERL_INTERFACE_INCLUDE_DIR ?= $(word 2, $(DIRS))
+ERL_INTERFACE_LIB_DIR ?= $(word 3, $(DIRS))
 
+CFLAGS += -std=c99 -finline-functions -Wall -Wmissing-prototypes -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR)
 LDLIBS += -L $(ERL_INTERFACE_LIB_DIR) -lei -lsqlite3
+
+# Set up DEBUG flags if DEBUG environment variable is set
+# The "variable trick" below allows using "DEBUG=1"
+ifdef DEBUG
+    CFLAGS += -O0 -g3 -fno-omit-frame-pointer -DSQLITE_DEBUG
+else
+    CFLAGS += -O3
+endif
+
+# Always build a shared binary (so, dll)
 LDFLAGS += -shared
 
-# Verbosity.
+# Sources and object files in C_SRC
+#SRC := $(shell find $(C_SRC_DIR) -type f \( -name "*.c" \))
+ifdef USE_SYSTEM_SQLITE
+    SRC := ${C_SRC_DIR}/sqlite_nif.c
+    CFLAGS += -DUSE_SYSTEM_SQLITE -DNO_SQLITE3_ERROR_OFFSET
+else
+	# SQLite amalgamation is a part of this project, but it's possible
+	#  that someone wants to use the system-provided one
+	SRC := ${C_SRC_DIR}/sqlite_nif.c ${C_SRC_DIR}/sqlite3.c
+endif
 
-c_verbose_0 = @echo " C     " $(?F);
-c_verbose = $(c_verbose_$(V))
+OBJ = $(addsuffix .o, $(basename $(SRC)))
 
-cpp_verbose_0 = @echo " CPP   " $(?F);
-cpp_verbose = $(cpp_verbose_$(V))
+# Disable implicit rules, they aren't helpful for this Makefile, polluting debug output
+.SUFFIXES:
 
-link_verbose_0 = @echo " LD    " $(@F);
-link_verbose = $(link_verbose_$(V))
-
-SOURCES := $(shell find $(C_SRC_DIR) -type f \( -name "*.c" -o -name "*.C" -o -name "*.cc" -o -name "*.cpp" \))
-OBJECTS = $(addsuffix .o, $(basename $(SOURCES)))
-
-COMPILE_C = $(c_verbose) $(CC) $(CFLAGS) $(CPPFLAGS) -c
-COMPILE_CPP = $(cpp_verbose) $(CXX) $(CXXFLAGS) $(CPPFLAGS) -c
-
-$(C_SRC_OUTPUT): $(OBJECTS)
-	@mkdir -p $(BASEDIR)/priv/
-	$(link_verbose) $(CC) $(OBJECTS) $(LDFLAGS) $(LDLIBS) -o $(C_SRC_OUTPUT)
+$(TARGET): $(OBJ)
+	$(CC) $(OBJ) $(LDFLAGS) $(LDLIBS) -o $(TARGET)
 
 %.o: %.c
-	$(COMPILE_C) $(OUTPUT_OPTION) $<
+	$(CC) $(CFLAGS) -o $@ -c $<
 
-%.o: %.cc
-	$(COMPILE_CPP) $(OUTPUT_OPTION) $<
-
-%.o: %.C
-	$(COMPILE_CPP) $(OUTPUT_OPTION) $<
-
-%.o: %.cpp
-	$(COMPILE_CPP) $(OUTPUT_OPTION) $<
+.PHONY: clean
 
 clean:
-	@rm -f $(C_SRC_OUTPUT) $(OBJECTS)
+	@rm -f $(OBJ) $(TARGET)
