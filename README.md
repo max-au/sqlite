@@ -2,15 +2,19 @@
 sqlite3 NIF implementation.
 
 ## Not implemented
-* tests!
+* reduce copy-paste in the NIF code
+* fix format_error to print useful messages in the shell
+* type bindings TEXT <-> BLOB
+* test for INTERRUPT (may crash VM when called in parallel with close/1)
 * performance (benchmarking) - especially in the memory allocation
 * performance - concurrent access to the same connection/statement (locking efficiency)
 * performance - see what can run on normal scheduler (yielding?)
 * memory leaks tests
-* tests for "garbage collector process" started with on_load, and the process shutdown
 * better/proper monitoring for ROWID changes
-* documentation
 * OS support (Linux, MacOS, Windows, FreeBSD)
+* message-based asynchronous APIs (instead of busy wait)
+* alphanumeric identifiers (non-positional) for bindings
+* document how to format EEP-54 errors 
 
 Extra Features
 * Online Backup support
@@ -22,17 +26,12 @@ Extra Features
 
 ## Cleanup
 * cleanup code from "memory assertions" and test errors (out of memory etc)
+* test enif_alloc/malloc performance
+* POTENTIAL ERTS BUG: when the process holding RESOURCE reference exits, no destructor is called
 
 
 ## Extended error structure (cause)
 
-```erlang
--type cause() :: #{
-    general => binary(),        %% sub-operation that failed "error opening connection"
-    detail => binary(),         %% detailed human-readable error, e.g. "missing permissions"
-    position => integer()       %% only set for preparing statements or, binding arguments, - column
-}.
-```
 
 ## Erlang to sqlite data type mapping
 Following primitive types in Erlang are mapped to corresponding sqlite types:
@@ -45,13 +44,4 @@ Following primitive types in Erlang are mapped to corresponding sqlite types:
 Potentially, in the future:
  * atom() <-> text?
  * map() <-> JSON?
-
-## Failing to load
-
-If the NIF fails with "Library load-call unsuccessful":
-* -1 fails to set memory functions
-* -2 fails to multithreading mode
-* -3 failed to initialise
-* -4 connection resource creation was unsuccessful
-* -5 statement resource creation failed
 
