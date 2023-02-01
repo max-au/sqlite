@@ -514,13 +514,12 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
         return make_badarg(env, NULL, 2, "not enough parameters");
 
     /* run the query */
+    result = enif_make_list(env, 0);
     ret = sqlite3_step(stmt);
     switch (ret) {
         case SQLITE_DONE:
-            result = am_ok;
             break;
         case SQLITE_ROW:
-            result = enif_make_list(env, 0);
             do {
                 int column_count = sqlite3_column_count(stmt);
                 int column_type;
@@ -764,7 +763,7 @@ static void update_callback(void *arg, int op_type, char const *db, char const *
             op = am_delete;
             break;
         case SQLITE_UPDATE:
-            op = am_delete;
+            op = am_update;
             break;
         default:
             op = am_undefined;

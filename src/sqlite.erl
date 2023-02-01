@@ -13,9 +13,6 @@
     monitor/1, demonitor/1, interrupt/1, system_info/0, get_last_insert_rowid/1
 ]).
 
-%% Internal export for erl_error formatter
--export([format_error/2]).
-
 %% NIF loading code
 -on_load(init/0).
 -nifs([sqlite_open_nif/2, sqlite_close_nif/1, sqlite_status_nif/1,
@@ -60,15 +57,30 @@ nif_stub_error(Line) ->
 %%     easily exhaust all ERTS Dirty I/O schedulers. Prefer WAL mode instead</li>
 %% </ul>
 
--type lookaside() :: #{
+-type lookaside_memory() :: #{
     used => integer(),
     max => integer(),
     hit => integer(),
     miss_size => integer(),
     miss_full => integer()
 }.
+%% SQLite connection lookaside memory usage
+%%
+%% <ul>
+%%   <li>`used': the current number of lookaside memory slots currently checked out
+%%     (current value of `SQLITE_DBSTATUS_LOOKASIDE_USED')</li>
+%%   <li>`max': high watermark of `SQLITE_DBSTATUS_LOOKASIDE_USED'</li>
+%%   <li>`hit': number of malloc attempts that were satisfied using lookaside memory
+%%     (high watermark of `SQLITE_DBSTATUS_LOOKASIDE_HIT')</li>
+%%   <li>`miss_size': the number malloc attempts that might have been satisfied using lookaside
+%%     memory but failed due to the amount of memory requested being larger than the lookaside slot size
+%%     (high watermark of `SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE')</li>
+%%   <li>`miss_full': the number malloc attempts that might have been satisfied using lookaside memory
+%%     but failed due to all lookaside memory already being in use
+%%     (high watermark of `SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL')</li>
+%% </ul>
 
--type cache() :: #{
+-type pager_cache_memory() :: #{
     used => integer(),
     shared => integer(),
     hit => integer(),
@@ -76,29 +88,54 @@ nif_stub_error(Line) ->
     write => integer(),
     spill => {Current :: integer(), Max :: integer()}
 }.
+%% SQLite connection pager cache memory usage
+%%
+%% <ul>
+%%   <li>`used': the approximate number of bytes of heap memory used by all pager caches
+%%     associated with the database connection (current value of `SQLITE_DBSTATUS_CACHE_USED')</li>
+%%   <li>`shared': current value of `SQLITE_DBSTATUS_CACHE_USED_SHARED'</li>
+%%   <li>`hit':  the number of pager cache hits that have occurred
+%%     (current value of `SQLITE_DBSTATUS_CACHE_HIT')</li>
+%%   <li>`miss': the number of pager cache misses that have occurred
+%%     (current value of SQLITE_DBSTATUS_CACHE_MISS)</li>
+%%   <li>`write': the number of dirty cache entries that have been written to disk
+%%     (current value of `SQLITE_DBSTATUS_CACHE_WRITE')</li>
+%%   <li>`spill': the number of dirty cache entries that have been written to disk in the middle
+%%     of a transaction due to the page cache overflowing. Both values of `SQLITE_DBSTATUS_CACHE_SPILL'</li>
+%% </ul>
+
 
 -type connection_status() :: #{
-    lookaside => lookaside(),
-    cache => cache(),
+    lookaside_memory => lookaside_memory(),
+    pager_cache_memory => pager_cache_memory(),
     schema => integer(),
     statement => integer(),
     deferred_fks => integer()
 }.
+%% SQLite connection status
+%%
+%% <ul>
+%%   <li>`schema': the approximate number of bytes of heap memory used to store the schema for
+%%     all databases associated with the connection (current value of `SQLITE_DBSTATUS_SCHEMA_USED')</li>
+%%   <li>`statement': the approximate number of bytes of heap and lookaside memory used by all
+%%     prepared statements associated with the database connection
+%%     (current value of `SQLITE_DBSTATUS_STMT_USED')</li>
+%%   <li>`deferred_fks': returns zero for the current value if and only if all foreign key
+%%     constraints (deferred or immediate) have been resolved (current value of `SQLITE_DBSTATUS_DEFERRED_FKS')</li>
+%% </ul>
 
-%% Prepared statement
 -type prepared_statement() :: reference().
+%% Prepared statement reference.
 
-%% Accepted types
 -type column_type() :: integer | float | binary.
+%% SQLite column type mapped to an Erlang type.
 
-%% Column name
 -type column_name() :: binary().
+%% Column name
 
-%% Only a subset of Erlang types is allowed in sqlite
 -type parameter() :: integer() | float() | binary() | string() | iolist().
+%% Erlang type allowed to be used in SQLite bindings.
 
-%% Only a subset of Erlang types are allowed in returned rows.
-%% However Erlang spec does not allow to express that.
 -type row() :: tuple().
 
 -type prepare_options() :: #{
@@ -114,7 +151,6 @@ nif_stub_error(Line) ->
 %%      (error code SQLITE_ERROR) if the statement uses any virtual tables. .</li>
 %% </ul>
 
-%% Prepared statement statistics
 -type statement_info() :: #{
     fullscan_step => integer(),
     sort => integer(),
@@ -126,20 +162,20 @@ nif_stub_error(Line) ->
     filter_hit => integer(),
     memory_used => integer()
 }.
+%% Prepared statement statistics
+%%
+%% Performance counters for SQLite statement. See `sqlite3_stmt_status'
+%% function in SQLite reference.
 
 -type system_info() :: #{
     memory_used => {Cur :: integer(), Max :: integer()},
     page_cache => {Size :: integer(), Used :: integer(), Max :: integer(), Overflow :: integer(), OverflowMax :: integer()},
     malloc => {Size :: integer(), Count :: integer(), Max :: integer()}
 }.
-
-%% Extended error information thrown by NIFs
--type cause() :: #{
-    general => unicode:chardata(),  %% sub-operation that failed "error opening connection"
-    reason => unicode:chardata(),   %% formatted user-readable error
-    pos_integer() => unicode:chardata(), %% argument that caused a problem, and a problem explanation
-    position => integer()           %% only set for preparing statements or binding arguments (column that had an error)
-}.
+%% Status information about the performance of SQLite
+%%
+%% See `sqlite3_status' in the SQLite reference for more details about
+%% exported statistics.
 
 %% @equiv open(FileName, #{})
 -spec open(file:filename_all()) -> connection().
@@ -183,14 +219,14 @@ status(Connection) ->
     end.
 
 %% @equiv query(Connection, Query, []).
--spec query(connection(), iodata()) -> ok | [row()].
+-spec query(connection(), iodata()) -> [row()].
 query(Connection, Query) ->
     query(Connection, Query, []).
 
 %% @doc Runs an SQL query using specified connection
 %%
-%% Returns `ok' for operations that do not assume any output, or a list of
-%% database rows.
+%% Returns a list of database rows, or an empty list if no rows are expected
+%% to be returned (e.g. `CREATE TABLE' statement).
 %%
 %% Query may contain placeholders, e.g. `?', `?1', `?2'. Number of placeholders
 %% must match the length of the parameters list. Binging function depends on
@@ -202,16 +238,13 @@ query(Connection, Query) ->
 %%   <li>`float()': </li>
 %% </ul>
 %%
-%% Returned database rows follow the same conversion rules.
 %%
 %% Throws `badarg' if connection is closed.
--spec query(connection(), iodata(), [parameter()]) -> ok | [row()].
+-spec query(connection(), iodata(), [parameter()]) -> [row()].
 query(Connection, Query, Parameter) ->
     case sqlite_query_nif(Connection, Query, Parameter) of
         {error, Reason, ExtErr} ->
             erlang:error(Reason, [Connection, Query, Parameter], [{error_info, #{cause => ExtErr}}]);
-        ok ->
-            ok;
         Result when is_list(Result) ->
             lists:reverse(Result)
     end.
@@ -224,6 +257,16 @@ prepare(Connection, Query) ->
 %% @doc Creates a prepared statement.
 %%
 %% Use `execute/2' to run the statement.
+%% Note that `close/1' invalidates all prepared statements created
+%% using the specified connection.
+%%
+%% By default, the prepared statement is not persistent. Note that
+%% if a single statement is going to be reused many times, it may
+%% prove useful to pass `persistent' option set to `true'.
+%%
+%% Running a single `query/3' once is more efficient than preparing
+%% a statement, executing it once and discarding.
+%%
 %% Throws `badarg' if the connection is closed.
 -spec prepare(connection(), iodata(), prepare_options()) -> prepared_statement().
 prepare(Connection, Query, Options) ->
@@ -258,21 +301,38 @@ info(Prepared) ->
             Description
     end.
 
-%% @doc Runs the prepared statement with new parameters passed.
+%% @doc Runs the prepared statement with parameters bound.
 %%
 %% See `query/3' for types and bindings details.
 %% Throws `badarg' if the connection is closed.
--spec execute(prepared_statement(), [parameter()]) -> ok | [row()].
+-spec execute(prepared_statement(), [parameter()]) -> [row()].
 execute(Prepared, Parameters) ->
     case sqlite_execute_nif(Prepared, Parameters) of
         {error, Reason, ExtErr} ->
             erlang:error(Reason, [Prepared, Parameters], [{error_info, #{cause => ExtErr}}]);
-        ok ->
-            ok;
         Result when is_list(Result) ->
             lists:reverse(Result)
     end.
 
+%% @doc EXPERIMENTAL: monitor updates happening through the connection.
+%%
+%% This function is intended for debugging INSERT, UPDATE and DELETE
+%% operations. The API is experimental and may change in the future
+%% without prior notice.
+%%
+%% Only one process may monitor a connection. Subsequent monitor calls
+%% replace the previously set process.
+%%
+%% Upon successful completion, calling process may start receiving
+%% messages of the following format:
+%% ```
+%% {Ref, Op, Database, Table, RowID}
+%% Example:
+%% {#Ref<0.1954006965.2226257955.79689>, insert, <<"main">>, <<"table">>, 123}
+%% '''
+%% `Ref' is the reference returned by `monitor/1' call, `Op' is one of
+%% `insert', `update' or `delete' operations, and `RowID' is the SQLite
+%% ROWID.
 -spec monitor(connection()) -> reference().
 monitor(Connection) ->
     case sqlite_monitor_nif(Connection, self()) of
@@ -282,6 +342,9 @@ monitor(Connection) ->
             Ref
     end.
 
+%% @doc Stops monitoring previously monitored connection.
+%%
+%% Does not flush messages that are already in transit.
 -spec demonitor(reference()) -> ok.
 demonitor(Ref) ->
     case sqlite_monitor_nif(Ref, undefined) of
@@ -293,6 +356,9 @@ demonitor(Ref) ->
 
 %% @doc Interrupts the query running on this connection.
 %%
+%% WARNING: this function is unsafe to use concurrently with
+%% closing the connection.
+%%
 %% Throws `badarg' if the connection is closed.
 -spec interrupt(connection()) -> ok.
 interrupt(Connection) ->
@@ -303,42 +369,13 @@ interrupt(Connection) ->
 system_info() ->
     sqlite_system_info_nif().
 
+%% @doc Usually returns the ROWID of the most recent successful INSERT
+%% into a rowid table or virtual table on database connection.
+%%
+%% See `sqlite3_last_insert_rowid' in the SQLite reference.
 -spec get_last_insert_rowid(connection()) -> integer().
 get_last_insert_rowid(Connection) ->
     sqlite_get_last_insert_rowid_nif(Connection).
-
-%% @doc Formats exception according to EEP-54.
-%%
-%% Used internally by the shell exception handler.
-%% Note that NIFs are not yet supported, and therefore exceptions are
-%% thrown by Erlang code. Use `erl_error' module to provide human-readable
-%% exception explanations.
-%%
-%%
--spec format_error(term(), list()) -> cause().
-%format_error({sqlite_error, Num}, [{_M, _F, Args, Info} | _]) ->
-%    erlang:display({sqlite_handler, '**************************', Num, Info}),
-%    #{cause := Cause} = proplists:get_value(error_info, Info, #{}),
-    %#{cause := #{details := Details} = Cause} = proplists:get_value(error_info, Info, #{}),
-    %Reason =
-%        case maps:find(position, Cause) of
-%            {ok, Col} ->
-%                [_, Arg | _] = Args,
-%                [From | _] = string:split(string:slice(Arg, Col), " "),
-%                lists:flatten(io_lib:format("SQLite Error ~b: ~s: at: ~b: near \"~s\"", [Num, Details, Col, From]));
-%            error ->
-%                %lists:flatten(io_lib:format("SQLite Error ~b: ~s", [Num, Details]))
-%        end,
-%    Cause#{reason => Reason};
-%    Cause;
-%format_error(badarg, [{_M, _F, _As, Info} | _]) ->
-%    erlang:display({badarg_handler, '**************************', Info}),
-%    #{cause := Cause} = proplists:get_value(error_info, Info, #{}),
-%    Cause#{reason => lists:flatten(io_lib:format("~p", [badarg]))};
-format_error(Other, [{_M, _F, _As, Info} | _]) ->
-%    erlang:display({other_handler, '**************************', Other}),
-    #{cause := Cause} = proplists:get_value(error_info, Info, #{}),
-    Cause.
 
 %%-------------------------------------------------------------------
 %% NIF stubs
@@ -385,6 +422,18 @@ sqlite_dirty_close_nif() ->
 %%-------------------------------------------------------------------
 %% Internal implementation
 
+%% The delayed deallocation process is needed when all connection
+%% references were Garbage Collected, but the connection was not
+%% closed. It is unsafe to close the connection in the GC callback
+%% code, because it could lock the scheduler for an arbitrary amount
+%% of time, and may lock the entire VM as it relies on schedulers being
+%% responsive.
+%% So the trick is to have a process that will collect such orphan
+%% connections and run delayed deallocation in a dirty I/O scheduler.
+%% There is no other purpose of this process.
+%% If the module gets purged, this process is stopped forcibly,
+%% causing NIF to fall back to closing connection in the GC callback,
+%% printing a warning to stderr.
 delayed_dealloc() ->
     receive
         undefined ->

@@ -2,10 +2,7 @@
 sqlite3 NIF implementation.
 
 ## Not implemented
-* reduce copy-paste in the NIF code
-* fix format_error to print useful messages in the shell
 * type bindings TEXT <-> BLOB
-* test for INTERRUPT (may crash VM when called in parallel with close/1)
 * performance (benchmarking) - especially in the memory allocation
 * performance - concurrent access to the same connection/statement (locking efficiency)
 * performance - see what can run on normal scheduler (yielding?)

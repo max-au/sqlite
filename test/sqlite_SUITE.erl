@@ -11,6 +11,7 @@
 -export([basic/1,
     shared/0, shared/1,
     shared_cache/0, shared_cache/1,
+    interrupt/0, interrupt/1,
     crash/1, types/1, close/1, status/1,
     race_close_prepare/0, race_close_prepare/1,
     enif_alloc/0, enif_alloc/1,
@@ -42,7 +43,7 @@ end_per_testcase(_TC, Config) ->
     Config.
 
 all() ->
-    [basic, shared, shared_cache, crash, types, close, status, enif_alloc, prepared, errors, monitor,
+    [basic, shared, shared_cache, interrupt, crash, types, close, status, enif_alloc, prepared, errors, monitor,
         concurrency, race_close_prepare, delayed_dealloc_kill, malloc].
 
 %%-------------------------------------------------------------------
@@ -94,15 +95,16 @@ ensure_unload(Mod) ->
 
 basic(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
     %% create a table with key -> value columns
     %% insert 1 => str
-    ok = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (1, 'str')"),
+    [] = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (1, 'str')"),
     Unicode = unicode:characters_to_binary("юникод"),
-    ok = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (?1, ?2)", [2, Unicode]),
+    [] = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (?1, ?2)", [2, Unicode]),
     ?assertEqual(2, sqlite:get_last_insert_rowid(Conn)),
     %% select
-    [{1, <<"str">>}, {2, Unicode}] = sqlite:query(Conn, "SELECT * from kv ORDER BY key").
+    [{1, <<"str">>}, {2, Unicode}] = sqlite:query(Conn, "SELECT * from kv ORDER BY key"),
+    [] = sqlite:query(Conn, "SELECT * from kv WHERE val = 'h'").
 
 
 shared() ->
@@ -113,7 +115,7 @@ shared(Config) when is_list(Config) ->
     Count = 4,
     Conns = [{Seq, sqlite:open(File, #{mode => read_write_create})} || Seq <- lists:seq(1, Count)],
     {1, C1} = hd(Conns),
-    ok = sqlite:query(C1, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER) STRICT"),
+    [] = sqlite:query(C1, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER) STRICT"),
     [sqlite:query(Conn, "INSERT INTO kv (val) VALUES (?1)", [Seq]) || {Seq, Conn} <- Conns],
     Sel = [sqlite:query(Conn, "SELECT val FROM kv ORDER BY val") || {_, Conn} <- Conns],
     %% must be the same
@@ -126,22 +128,22 @@ shared_cache() ->
 shared_cache(Config) when is_list(Config) ->
     Db1 = sqlite:open("file::mem:", #{flags => [shared, memory, uri]}),
     Db2 = sqlite:open("file::mem:", #{flags => [shared, memory, uri]}),
-    ok = sqlite:query(Db1, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
-    ok = sqlite:query(Db1, "INSERT INTO kv (val) VALUES (?1)", [1]),
+    [] = sqlite:query(Db1, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
+    [] = sqlite:query(Db1, "INSERT INTO kv (val) VALUES (?1)", [1]),
     ?assertEqual([{1}], sqlite:query(Db2, "SELECT val FROM kv ORDER BY val")),
     sqlite:close(Db1), sqlite:close(Db2).
 
 types(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE types (t1 TEXT, b1 BLOB, i1 INTEGER, f1 REAL) STRICT"),
+    [] = sqlite:query(Conn, "CREATE TABLE types (t1 TEXT, b1 BLOB, i1 INTEGER, f1 REAL) STRICT"),
     %% binary
     %% string
     %% integer. Test small and bignum
     PreparedInt = sqlite:prepare(Conn, "INSERT INTO types (i1) VALUES ($1)"),
-    ok = sqlite:execute(PreparedInt, [576460752303423489]), %% bigint but fits
-    ok = sqlite:execute(PreparedInt, [-576460752303423490]), %% bigint but fits
-    ok = sqlite:execute(PreparedInt, [-576460752303423489]), %% small int
-    ok = sqlite:execute(PreparedInt, [576460752303423488]), %% small int
+    [] = sqlite:execute(PreparedInt, [576460752303423489]), %% bigint but fits
+    [] = sqlite:execute(PreparedInt, [-576460752303423490]), %% bigint but fits
+    [] = sqlite:execute(PreparedInt, [-576460752303423489]), %% small int
+    [] = sqlite:execute(PreparedInt, [576460752303423488]), %% small int
     [{-576460752303423490}, {-576460752303423489}, {576460752303423488}, {576460752303423489}] =
         sqlite:query(Conn, "SELECT i1 FROM types WHERE i1 IS NOT NULL ORDER BY i1"),
     ?assertExtended(error, badarg,
@@ -151,8 +153,8 @@ types(Config) when is_list(Config) ->
     PreparedFloat = sqlite:prepare(Conn, "INSERT INTO types (f1) VALUES ($1)"),
     Pi = math:pi(),
     NegativePi = -Pi,
-    ok = sqlite:execute(PreparedFloat, [Pi]),
-    ok = sqlite:execute(PreparedFloat, [NegativePi]),
+    [] = sqlite:execute(PreparedFloat, [Pi]),
+    [] = sqlite:execute(PreparedFloat, [NegativePi]),
     [{NegativePi}, {Pi}] = sqlite:query(Conn, "SELECT f1 FROM types WHERE f1 IS NOT NULL ORDER BY f1"),
     %% null (undefined)
     %% atom (??!)
@@ -168,7 +170,7 @@ types(Config) when is_list(Config) ->
 
 status(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
     Prepared = sqlite:prepare(Conn, "INSERT INTO kv (key, val) VALUES (1, ?1)"),
     %% sanity check, that fields are present, but not beyond that. Should are real assertions here
     #{cache := Cache, deferred_fks := 0, statement := _,  lookaside := Lookaside} = sqlite:status(Conn),
@@ -187,14 +189,14 @@ enif_alloc() ->
 
 enif_alloc(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
     Bin = iolist_to_binary([<<"1234567890ABCDEF">> || _ <- lists:seq(1, 128)]),
     Repeats = 16,
     BinSize = byte_size(Bin) * Repeats,
     Statement = sqlite:prepare(Conn, "INSERT INTO kv (key, val) VALUES (?1, ?2)"),
     %% test that erlang:memory() reflects changes when large allocations are done
     Before = erlang:memory(system),
-    [ok = sqlite:execute(Statement, [Seq, Bin]) || Seq <- lists:seq(1, Repeats)],
+    [[] = sqlite:execute(Statement, [Seq, Bin]) || Seq <- lists:seq(1, Repeats)],
     Diff = erlang:memory(system) - Before,
     %% system memory should grow ~2x of the binding size
     ?assert(Diff > BinSize andalso Diff < (3 * BinSize), {difference, Diff, byte_size, BinSize}).
@@ -215,9 +217,9 @@ malloc(Config) when is_list(Config) ->
 
 prepared(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
     PreparedInsert = sqlite:prepare(Conn, "INSERT INTO kv (key, val) VALUES (?1, ?2)"),
-    ok = sqlite:execute(PreparedInsert, [1, "string"]),
+    [] = sqlite:execute(PreparedInsert, [1, "string"]),
     PreparedSel = sqlite:prepare(Conn, "SELECT * FROM kv WHERE key = ?1"),
     [{1, <<"string">>}] = sqlite:execute(PreparedSel, [1]),
     %% test statement into
@@ -225,28 +227,62 @@ prepared(Config) when is_list(Config) ->
 
 monitor(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
     Ref = sqlite:monitor(Conn),
     %% verify monitoring works
-    ok = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (1, 'str')"),
+    [] = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (1, 'str')"),
     receive
         {Ref, insert, <<"main">>, <<"kv">>, _RowId} -> ok
     after 10 -> ?assert(false, "monitoring did not work, expected message is not received")
     end,
     %% test demonitoring
     sqlite:demonitor(Ref),
-    ok = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (2, 'str')"),
+    [] = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (2, 'str')"),
     receive Unexpected2 -> ?assert(false, {unexpected, Unexpected2})
     after 10 -> ok
     end.
 
 close(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
     ok = sqlite:close(Conn),
     ?assertExtended(error, badarg, #{cause => #{1 => <<"connection closed">>}},
         sqlite:prepare(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT")),
     ?assertExtended(error, badarg, #{cause => #{1 => <<"connection already closed">>}}, sqlite:close(Conn)).
+
+
+interrupt() ->
+    [{doc, "Tests that interrupt works, and hopefully not crashing the VM"}].
+
+interrupt(Config) when is_list(Config) ->
+    %% run 3 processes: one executes long query, another one interrupts
+    %% third process closes the connection...
+    Conn = sqlite:open("", #{flags => [memory]}),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT) STRICT"),
+    %% insert many rows many times
+    LongString = iolist_to_binary([<<"('1234567890ABCDEF'),">> || _ <- lists:seq(1, 128)]),
+    Insert = <<"INSERT INTO kv (val) VALUES ", LongString/binary, "('ok')">>,
+    [[] = sqlite:query(Conn, Insert) || _ <- lists:seq(1, 100)],
+    %% now do the test
+    Long = spawn_link(fun () -> long_running(Conn) end),
+    Interrupt = spawn_link(fun () -> timer:sleep(10), sqlite:interrupt(Conn) end),
+    Close = spawn_link(fun () -> timer:sleep(10), sqlite:close(Conn) end),
+    %% do the actual test
+    Workers = [Long, Interrupt, Close],
+    Monitors = [{W, erlang:monitor(process, W)} || W <- Workers],
+    %% wait for all of them to complete (with no error, otherwise the link crashes test runner)
+    [receive {'DOWN', Mon, process, Pid, Reason} -> Reason end || {Pid, Mon} <- Monitors].
+
+long_running(Conn) ->
+    try
+        _ = sqlite:query(Conn, "SELECT key FROM kv WHERE val LIKE '%W%d%s'"),
+        long_running(Conn)
+    catch
+        error:{sqlite_error, 9} ->
+            ok;
+        error:badarg ->
+            ok %% connection closed is also expected
+    end.
 
 crash(Config) when is_list(Config) ->
     %% ensures that even after GC prepared statement is working
@@ -302,7 +338,7 @@ errors(Config) when is_list(Config) ->
         sqlite:open("not_exist", #{mode => read_only})),
     %% need a statement for testing
     Db = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Db, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val STRING)"),
+    [] = sqlite:query(Db, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val STRING)"),
     %% errors while preparing query
     ?assertExtended(error, {sqlite_error, 1}, #{cause => #{general => <<"error preparing statement">>,
         2 => <<"SQL logic error near column 30: \"WHERE\"">>, position => 30}},
@@ -327,7 +363,7 @@ concurrency(Config) when is_list(Config) ->
     FileName = filename:join(proplists:get_value(priv_dir, Config), "db.bin"),
     %% create a DB with schema
     Db = sqlite:open(FileName, #{mode => read_write_create}),
-    ok = sqlite:query(Db, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
+    [] = sqlite:query(Db, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
     sqlite:close(Db),
     %% share a connection (and prepared statements) between many workers using ETS
     Workers = [erlang:spawn_link(fun() -> worker(Seq, FileName) end) || Seq <- lists:seq(1, Concurrency)],
@@ -384,7 +420,7 @@ race_close_prepare(Config) when is_list(Config) ->
 do_race(0) -> ok;
 do_race(Count) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
     %%
     Preparer = spawn_link(fun() -> do_prepare(1000, Conn) end),
     Closer = spawn_link(fun() -> timer:sleep(2), sqlite:close(Conn) end),
@@ -409,7 +445,7 @@ benchmark_prepared(Config) when is_list(Config) ->
 
 measure_one(FunTo, Kind) ->
     Conn = sqlite:open("", #{flags => [memory]}),
-    ok = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
     [erlang:garbage_collect(Pid) || Pid <- processes()], %% ensure no garbage in the system
     MemBefore = erlang:memory(system),
     {TimeUs, _} = timer:tc(fun () -> FunTo(100000, Conn), erlang:garbage_collect() end),
