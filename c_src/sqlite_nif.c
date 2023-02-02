@@ -1,3 +1,7 @@
+/*
+ * TODO: cleanup code from "memory assertions" - handle OOM gracefully
+ */
+
 #include <string.h>
 #include <ctype.h>
 #include <erl_nif.h>
@@ -38,6 +42,8 @@ static ERL_NIF_TERM am_position;
 static ERL_NIF_TERM am_out_of_memory;   /* out of memory */
 static ERL_NIF_TERM am_sqlite_error;    /* sqlite-specific error code */
 static ERL_NIF_TERM am_blob;
+static ERL_NIF_TERM am_done;
+static ERL_NIF_TERM am_busy;
 
 /* database open modes */
 static ERL_NIF_TERM am_mode;
@@ -465,12 +471,12 @@ static ERL_NIF_TERM sqlite_dirty_close_nif(ErlNifEnv *env, int argc, const ERL_N
     return am_ok;
 }
 
-/* bind & execute */
-static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF_TERM params, int arg_index) {
+/* bind & execute helpers */
+static ERL_NIF_TERM bind(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF_TERM params, int arg_index) {
     ErlNifSInt64 int_val;
     double double_val;
     ErlNifBinary bin;
-    ERL_NIF_TERM param, result;
+    ERL_NIF_TERM param;
     const ERL_NIF_TERM* tuple;
     int ret, column = 1, arity;
     int expected = sqlite3_bind_parameter_count(stmt);
@@ -515,46 +521,56 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
     if (column <= expected) 
         return make_badarg(env, NULL, 2, "not enough parameters");
 
-    /* run the query */
-    result = enif_make_list(env, 0);
-    ret = sqlite3_step(stmt);
+    return THE_NON_VALUE;
+}
+
+static ERL_NIF_TERM fetch_row(ErlNifEnv *env, sqlite3_stmt* stmt, int column_count) {
+    int column_type;
+    unsigned int size;
+    ErlNifSInt64 int_val;
+    double double_val;
+    ERL_NIF_TERM values[column_count]; /* FIXME: C99 supports this via alloca(), but is that safe enough? */
+    for (int i=0; i<column_count; i++) {
+        column_type = sqlite3_column_type(stmt, i);
+        switch (column_type) {
+            case SQLITE_NULL:
+                values[i] = am_undefined;
+                break;
+            case SQLITE_TEXT:
+                size = sqlite3_column_bytes(stmt, i);
+                const char* text = (const char*)sqlite3_column_text(stmt, i);
+                values[i] = make_binary(env, text, size);
+                break;
+            case SQLITE_INTEGER:
+                int_val = sqlite3_column_int64(stmt, i);
+                values[i] = enif_make_int64(env, int_val);
+                break;
+            case SQLITE_FLOAT:
+                double_val = sqlite3_column_double(stmt, i);
+                values[i] = enif_make_double(env, double_val);
+                break;
+            case SQLITE_BLOB:
+                size = sqlite3_column_bytes(stmt, i);
+                const char* blob = (const char*)sqlite3_column_blob(stmt, i);
+                values[i] = make_binary(env, blob, size);
+                break;
+        }
+    }
+    return enif_make_tuple_from_array(env, values, column_count);
+}
+
+/* runs the query with pre-bound arguments */
+static ERL_NIF_TERM execute(ErlNifEnv *env, sqlite3_stmt* stmt) {
+    ERL_NIF_TERM result = enif_make_list(env, 0);
+    int ret = sqlite3_step(stmt);
     switch (ret) {
         case SQLITE_DONE:
             break;
         case SQLITE_ROW:
+            int column_count = sqlite3_column_count(stmt);
+            ERL_NIF_TERM row;
             do {
-                int column_count = sqlite3_column_count(stmt);
-                int column_type;
-                unsigned int size;
-                ERL_NIF_TERM row;
-                ERL_NIF_TERM values[column_count]; /* C99 supports this, but it's discouraged, maybe use enif_alloc? */
-                for (int i=0; i<column_count; i++) {
-                    column_type = sqlite3_column_type(stmt, i);
-                    switch (column_type) {
-                        case SQLITE_NULL:
-                            values[i] = am_undefined;
-                            break;
-                        case SQLITE_BLOB:
-                            size = sqlite3_column_bytes(stmt, i);
-                            const char* blob = (const char*)sqlite3_column_blob(stmt, i);
-                            values[i] = make_binary(env, blob, size);
-                            break;
-                        case SQLITE_TEXT:
-                            size = sqlite3_column_bytes(stmt, i);
-                            const char* text = (const char*)sqlite3_column_text(stmt, i);
-                            values[i] = make_binary(env, text, size);
-                            break;
-                        case SQLITE_INTEGER:
-                            int_val = sqlite3_column_int64(stmt, i);
-                            values[i] = enif_make_int64(env, int_val);
-                            break;
-                        case SQLITE_FLOAT:
-                            double_val = sqlite3_column_double(stmt, i);
-                            values[i] = enif_make_double(env, double_val);
-                            break;
-                    }
-                }
-                row = enif_make_tuple_from_array(env, values, column_count);
+                row = fetch_row(env, stmt, column_count);
                 result = enif_make_list_cell(env, row, result);
                 ret = sqlite3_step(stmt);
             } while (ret == SQLITE_ROW);
@@ -654,6 +670,97 @@ static ERL_NIF_TERM sqlite_prepare_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
     return stmt_res_term;
 }
 
+/* Binds parameters of the prepared statement */
+static ERL_NIF_TERM sqlite_bind_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    statement_resource_t* stmt;
+
+    if (!enif_get_resource(env, argv[0], s_statement_resource, (void **) &stmt))
+        return make_badarg(env, NULL, 1, "not a prepared statement");
+
+    enif_mutex_lock(stmt->connection->mutex);
+    if (!stmt->connection->connection) {
+        enif_mutex_unlock(stmt->connection->mutex);
+        return make_badarg(env, NULL, 1, "connection closed");
+    }
+
+    ERL_NIF_TERM result = bind(env, stmt->reference->statement, argv[1], 2);
+    enif_mutex_unlock(stmt->connection->mutex);
+    return result == THE_NON_VALUE ? am_ok : result;
+}
+
+/* Single query step */
+static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    statement_resource_t* stmt;
+    ErlNifSInt64 steps;
+
+    if (!enif_get_int64(env, argv[1], &steps) || steps < 1)
+        return make_badarg(env, NULL, 2, "invalid step count");
+
+    if (!enif_get_resource(env, argv[0], s_statement_resource, (void **) &stmt))
+        return make_badarg(env, NULL, 1, "not a prepared statement");
+
+    enif_mutex_lock(stmt->connection->mutex);
+    if (!stmt->connection->connection) {
+        enif_mutex_unlock(stmt->connection->mutex);
+        return make_badarg(env, NULL, 1, "connection closed");
+    }
+
+    int ret;
+    ERL_NIF_TERM result;
+    sqlite3_stmt* sqlite_stmt = stmt->reference->statement;
+
+    if (steps == 1) {
+        /* single step return */
+        ret = sqlite3_step(sqlite_stmt);
+        switch (ret) {
+            case SQLITE_DONE:
+                result = am_done;
+                break;
+            case SQLITE_BUSY:
+                result = am_busy;
+                break;
+            case SQLITE_ROW:
+                result = fetch_row(env, sqlite_stmt, sqlite3_column_count(sqlite_stmt));
+                break;
+            default:
+                result = make_generic_sqlite_error(env, ret, "error running query");
+                break;
+        }
+    } else {
+        /* multi-step return - either [Row] list, or a tuple of {done|busy, [Row]}*/
+        result = enif_make_list(env, 0);
+        while (steps > 0) {
+            int column_count = sqlite3_column_count(sqlite_stmt);
+            ERL_NIF_TERM row;
+            steps--;
+            ret = sqlite3_step(sqlite_stmt);
+            switch (ret) {
+                case SQLITE_DONE:
+                    result = enif_make_tuple2(env, am_done, result);
+                    steps = 0;
+                    break;
+                case SQLITE_BUSY:
+                    result = enif_make_tuple2(env, am_busy, result);
+                    steps = 0;
+                    break;
+                case SQLITE_ROW:
+                    row = fetch_row(env, sqlite_stmt, column_count);
+                    result = enif_make_list_cell(env, row, result);
+                    break;
+                default:
+                    result = make_generic_sqlite_error(env, ret, "error running query");
+                    steps = 0;
+                    break;
+            }
+        }
+    }
+
+    enif_mutex_unlock(stmt->connection->mutex);
+    return result;
+}
+
 /* Query execution */
 static ERL_NIF_TERM sqlite_execute_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -674,7 +781,12 @@ static ERL_NIF_TERM sqlite_execute_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
         return make_generic_sqlite_error(env, ret, "error resetting statement");
     }
 
-    ERL_NIF_TERM result = bind_and_execute(env, stmt->reference->statement, argv[1], 2);
+    ERL_NIF_TERM result = bind(env, stmt->reference->statement, argv[1], 2);
+    if (result != THE_NON_VALUE) {
+        enif_mutex_unlock(stmt->connection->mutex);
+        return result;
+    }
+    result = execute(env, stmt->reference->statement);
     enif_mutex_unlock(stmt->connection->mutex);
     return result;
 }
@@ -739,7 +851,13 @@ static ERL_NIF_TERM sqlite_query_nif(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return make_sql_error(env, conn->connection, ret, "error preparing statement", 2, query_bin.data, query_bin.size);
     }
 
-    ERL_NIF_TERM result = bind_and_execute(env, stmt, argv[2], 3);
+    ERL_NIF_TERM result = bind(env, stmt, argv[2], 3);
+    if (result != THE_NON_VALUE) {
+        sqlite3_finalize(stmt);
+        enif_mutex_unlock(conn->mutex);
+        return result;
+    }
+    result = execute(env, stmt);
 
     /* cleanup */
     sqlite3_finalize(stmt);
@@ -959,6 +1077,8 @@ static ErlNifFunc nif_funcs[] = {
     {"sqlite_status_nif", 1, sqlite_status_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"sqlite_query_nif", 3, sqlite_query_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"sqlite_prepare_nif", 3, sqlite_prepare_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_bind_nif", 2, sqlite_bind_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_step_nif", 2, sqlite_step_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"sqlite_info_nif", 1, sqlite_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"sqlite_describe_nif", 1, sqlite_describe_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"sqlite_execute_nif", 2, sqlite_execute_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -1056,6 +1176,8 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM load_info)
     am_out_of_memory = enif_make_atom(env, "out_of_memory");
     am_sqlite_error = enif_make_atom(env, "sqlite_error");
     am_blob = enif_make_atom(env, "blob");
+    am_done = enif_make_atom(env, "done");
+    am_busy = enif_make_atom(env, "busy");
 
     am_mode = enif_make_atom(env, "mode");
     am_flags = enif_make_atom(env, "flags");

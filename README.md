@@ -79,9 +79,7 @@ in the following releases:
 
 
 ## TODO: LIST OF THINGS TO BE DONE BEFORE RELEASE
-* Limit on ROWS returned via execute/query
 * performance - concurrent access to the same connection/statement (locking efficiency)
 * performance - see what can run on normal scheduler (yielding?)
 * OS support (Linux, MacOS, Windows, FreeBSD)
-* cleanup code from "memory assertions" and test errors (out of memory etc)
 * POTENTIAL ERTS BUG: when the process holding RESOURCE reference exits, no destructor is called

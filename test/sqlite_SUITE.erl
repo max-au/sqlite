@@ -9,6 +9,7 @@
 
 %% Test cases
 -export([basic/1,
+    bind_step/0, bind_step/1,
     shared/0, shared/1,
     shared_cache/0, shared_cache/1,
     interrupt/0, interrupt/1,
@@ -43,8 +44,9 @@ end_per_testcase(_TC, Config) ->
     Config.
 
 all() ->
-    [basic, shared, shared_cache, interrupt, crash, types, close, status, enif_alloc, prepared, errors, monitor,
-        concurrency, race_close_prepare, delayed_dealloc_kill, malloc].
+    [basic, bind_step, shared, shared_cache, interrupt, crash, types, close, status,
+        enif_alloc, prepared, errors, monitor, concurrency, race_close_prepare,
+        delayed_dealloc_kill, malloc].
 
 %%-------------------------------------------------------------------
 %% Convenience functions
@@ -237,6 +239,27 @@ prepared(Config) when is_list(Config) ->
     [{1, <<"string">>}] = sqlite:execute(PreparedSel, [1]),
     %% test statement into
     ?assertEqual([{<<"key">>,<<"INTEGER">>},{<<"val">>,<<"TEXT">>}], sqlite:describe(PreparedSel)).
+
+bind_step() ->
+    [{doc, "Tests bind/2 and step/1,2"}].
+
+bind_step(Config) when is_list(Config) ->
+    Conn = sqlite:open("", #{flags => [memory]}),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT) STRICT"),
+    PreparedInsert = sqlite:prepare(Conn, "INSERT INTO kv (val) VALUES (?1)"),
+    ok = sqlite:bind(PreparedInsert, ["str"]),
+    done = sqlite:step(PreparedInsert),
+    done = sqlite:step(PreparedInsert), %% sqlite allows that, and inserts another row
+    %% insert & select multiple rows
+    PreparedMultiInsert = sqlite:prepare(Conn, "INSERT INTO kv (val) VALUES (?1), (?), (?)"),
+    ok = sqlite:bind(PreparedMultiInsert, ["2", "3", "4"]),
+    {done, []} = sqlite:step(PreparedMultiInsert, 10),
+    %% select
+    PreparedSelect = sqlite:prepare(Conn, "SELECT * FROM kv ORDER BY key"),
+    [{1, <<"str">>}, {2, <<"str">>}] = sqlite:step(PreparedSelect, 2),
+    [{3, <<"2">>}, {4, <<"3">>}] = sqlite:step(PreparedSelect, 2),
+    {done, [{5, <<"4">>}]} = sqlite:step(PreparedSelect, 10),
+    sqlite:close(Conn).
 
 monitor(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
