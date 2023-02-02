@@ -4,5 +4,5 @@ rebar3.crashdump
 .idea
 *.iml
 .vscode
-
-
+doc
+perf.data

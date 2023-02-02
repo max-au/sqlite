@@ -99,11 +99,12 @@ basic(Config) when is_list(Config) ->
     %% create a table with key -> value columns
     %% insert 1 => str
     [] = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (1, 'str')"),
-    Unicode = unicode:characters_to_binary("юникод"),
-    [] = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (?1, ?2)", [2, Unicode]),
+    Unicode = "юникод",
+    [] = sqlite:query(Conn, "INSERT INTO kv (key, val) VALUES (?1, ?2)", [2, unicode:characters_to_binary(Unicode)]),
     ?assertEqual(2, sqlite:get_last_insert_rowid(Conn)),
     %% select
-    [{1, <<"str">>}, {2, Unicode}] = sqlite:query(Conn, "SELECT * from kv ORDER BY key"),
+    [{1, <<"str">>}, {2, Encoded}] = sqlite:query(Conn, "SELECT * from kv ORDER BY key"),
+    ?assertEqual(Unicode, unicode:characters_to_list(Encoded)),
     [] = sqlite:query(Conn, "SELECT * from kv WHERE val = 'h'").
 
 
@@ -136,9 +137,20 @@ shared_cache(Config) when is_list(Config) ->
 types(Config) when is_list(Config) ->
     Conn = sqlite:open("", #{flags => [memory]}),
     [] = sqlite:query(Conn, "CREATE TABLE types (t1 TEXT, b1 BLOB, i1 INTEGER, f1 REAL) STRICT"),
-    %% binary
-    %% string
-    %% integer. Test small and bignum
+    %% TEXT storage class
+    PreparedText = sqlite:prepare(Conn, "INSERT INTO types (t1) VALUES (?1)"),
+    [] = sqlite:execute(PreparedText, [<<"TXTBIN">>]), %% accept a binary
+    [] = sqlite:execute(PreparedText, ["TXTSTR"]), %% accept a string
+    [] = sqlite:execute(PreparedText, [["T", ["XT"], <<"IO">>]]), %% accept an iolist
+    %% get that back as a binary
+    [{<<"TXTBIN">>}, {<<"TXTIO">>}, {<<"TXTSTR">>}] =
+        sqlite:query(Conn, "SELECT t1 FROM types WHERE t1 IS NOT NULL ORDER BY t1"),
+    %% test a wrapper turning binaries back to string
+    %%
+    %% BLOB storage class
+    [] = sqlite:query(Conn, "INSERT INTO types (b1) VALUES (?1)", [{blob, <<1,2,3,4,5,6>>}]),
+    [{<<1,2,3,4,5,6>>}] = sqlite:query(Conn, "SELECT b1 FROM types WHERE b1 IS NOT NULL"),
+    %% INTEGER storage class
     PreparedInt = sqlite:prepare(Conn, "INSERT INTO types (i1) VALUES ($1)"),
     [] = sqlite:execute(PreparedInt, [576460752303423489]), %% bigint but fits
     [] = sqlite:execute(PreparedInt, [-576460752303423490]), %% bigint but fits
@@ -149,7 +161,7 @@ types(Config) when is_list(Config) ->
     ?assertExtended(error, badarg,
         #{cause => #{2 => <<"bignum not supported">>, position => 1, general => <<"failed to bind parameter">>}},
         sqlite:execute(PreparedInt, [18446744073709551615])),
-    %% float
+    %% FLOAT storage class
     PreparedFloat = sqlite:prepare(Conn, "INSERT INTO types (f1) VALUES ($1)"),
     Pi = math:pi(),
     NegativePi = -Pi,
@@ -157,7 +169,7 @@ types(Config) when is_list(Config) ->
     [] = sqlite:execute(PreparedFloat, [NegativePi]),
     [{NegativePi}, {Pi}] = sqlite:query(Conn, "SELECT f1 FROM types WHERE f1 IS NOT NULL ORDER BY f1"),
     %% null (undefined)
-    %% atom (??!)
+    %% atom
     Unsupported = #{cause => #{2 => <<"unsupported type">>, position => 1, general => <<"failed to bind parameter">>}},
     %% reference/fun/pid/port/THING
     ?assertExtended(error, badarg, Unsupported, sqlite:execute(PreparedInt, [self()])),
@@ -173,7 +185,8 @@ status(Config) when is_list(Config) ->
     [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val TEXT) STRICT"),
     Prepared = sqlite:prepare(Conn, "INSERT INTO kv (key, val) VALUES (1, ?1)"),
     %% sanity check, that fields are present, but not beyond that. Should are real assertions here
-    #{cache := Cache, deferred_fks := 0, statement := _,  lookaside := Lookaside} = sqlite:status(Conn),
+    #{deferred_fks := 0, statement := _,  lookaside_memory := Lookaside,
+        pager_cache_memory := Cache} = sqlite:status(Conn),
     #{used := Used, shared := _Shared, hit := Hit, miss := _Miss, write := _Write, spill := _Spill} = Cache,
     #{used := _, max := _Max, hit := _, miss_size := _, miss_full := _} = Lookaside,
     ?assert(Used > 0, {used, Used}),

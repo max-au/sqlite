@@ -1,8 +1,20 @@
-%%%-------------------------------------------------------------------
 %%% @copyright (C) 2023 Maxim Fedorov
-%%% sqlite3 NIF bindings
 %%% @doc
+%%% sqlite3 NIF bindings for Erlang.
 %%%
+%%% See {@link query/3} for the data type conversion rules.
+%%%
+%%% All APIs of this module provide extended error information for the shell.
+%%% This information is also accessible programmatically using `erl_error'.
+%%% ```
+%%% try
+%%%    sqlite:prepare(sqlite:open(""), "INSERT INTO kv (key, val) VALU1ES (2, 2)")
+%%% catch
+%%%    Class:Reason:Stack ->
+%%%        Formatted = erl_error:format_exception(Class, Reason, Stack),
+%%%        io:format(lists:flatten(Formatted))
+%%% end.
+%%% '''
 %%% @end
 -module(sqlite).
 -author("maximfca@gmail.com").
@@ -12,6 +24,9 @@
     query/2, query/3, prepare/2, prepare/3, info/1, describe/1, execute/2,
     monitor/1, demonitor/1, interrupt/1, system_info/0, get_last_insert_rowid/1
 ]).
+
+%% Internal export for erl_error formatter
+-export([format_error/2]).
 
 %% NIF loading code
 -on_load(init/0).
@@ -133,7 +148,7 @@ nif_stub_error(Line) ->
 -type column_name() :: binary().
 %% Column name
 
--type parameter() :: integer() | float() | binary() | string() | iolist().
+-type parameter() :: integer() | float() | binary() | string() | iolist() | {binary, binary()} | undefined.
 %% Erlang type allowed to be used in SQLite bindings.
 
 -type row() :: tuple().
@@ -146,9 +161,9 @@ nif_stub_error(Line) ->
 %%
 %% <ul>
 %%   <li>`persistent': The SQLITE_PREPARE_PERSISTENT flag is a hint to the query planner that
-%%      the prepared statement will be retained for a long time and probably reused many times..</li>
+%%      the prepared statement will be retained for a long time and probably reused many times.</li>
 %%   <li>`no_vtab': The SQLITE_PREPARE_NO_VTAB flag causes the SQL compiler to return an error
-%%      (error code SQLITE_ERROR) if the statement uses any virtual tables. .</li>
+%%      (error code SQLITE_ERROR) if the statement uses any virtual tables. </li>
 %% </ul>
 
 -type statement_info() :: #{
@@ -218,26 +233,34 @@ status(Connection) ->
             Status
     end.
 
-%% @equiv query(Connection, Query, []).
+%% @equiv query(Connection, Query, [])
 -spec query(connection(), iodata()) -> [row()].
 query(Connection, Query) ->
     query(Connection, Query, []).
 
 %% @doc Runs an SQL query using specified connection
 %%
-%% Returns a list of database rows, or an empty list if no rows are expected
-%% to be returned (e.g. `CREATE TABLE' statement).
-%%
 %% Query may contain placeholders, e.g. `?', `?1', `?2'. Number of placeholders
-%% must match the length of the parameters list. Binging function depends on
-%% the passed parameter type:
+%% must match the length of the parameters list.
+%%
+%% Parameters are converted to sqlite storage classed using following type mappings:
 %% <ul>
-%%   <li>`undefined': </li>
-%%   <li>`binary()': </li>
-%%   <li>`integer()': </li>
-%%   <li>`float()': </li>
+%%   <li>`binary()': accepts an Erlang binary stored as a TEXT in sqlite. See `unicode' module for
+%%    transformations between Unicode characters list and a binary</li>
+%%   <li>`string()': accepts an Erlang string limited to `iolist()' type, stored as a TEXT</li>
+%%   <li>`iolist()': accepts lists supported by {@link erlang:iolist_to_binary/1}, stored as a TEXT</li>
+%%   <li>`integer()': accepts a 64-bit signed integer (BIGNUM is not supported), stored as an INTEGER</li>
+%%   <li>`float()': accepts IEEE floating point number, stored as a FLOAT</li>
+%%   <li>`undefined': stored as NULL</li>
+%%   <li>`{blob, binary()}': accepts an Erlang binary stored as a BLOB</li>
 %% </ul>
 %%
+%% Returns a list of database rows, or an empty list if no rows are expected
+%% to be returned (e.g. `CREATE TABLE' statement). By default, all TEXT fields are
+%% returned as Erlang `binary()' type for performance reasons.
+%%
+%% BLOB is always returned as a binary. Note that wrapping in `{binary, Bin}' tuple is
+%% only necessary for parameters, to tell the actual binary from an UTF8 encoded string.
 %%
 %% Throws `badarg' if connection is closed.
 -spec query(connection(), iodata(), [parameter()]) -> [row()].
@@ -249,7 +272,7 @@ query(Connection, Query, Parameter) ->
             lists:reverse(Result)
     end.
 
-%% @equiv prepare(Connection, Query, #{}).
+%% @equiv prepare(Connection, Query, #{})
 -spec prepare(connection(), iodata()) -> prepared_statement().
 prepare(Connection, Query) ->
     prepare(Connection, Query, #{}).
@@ -376,6 +399,17 @@ system_info() ->
 -spec get_last_insert_rowid(connection()) -> integer().
 get_last_insert_rowid(Connection) ->
     sqlite_get_last_insert_rowid_nif(Connection).
+
+%% @doc Formats exception according to EEP-54.
+%%
+%% Used internally by the shell exception handler.
+%% Note that NIFs are not yet supported, and therefore exceptions are
+%% thrown by Erlang code. Use `erl_error' module to provide human-readable
+%% exception explanations.
+format_error(_Reason, [{_M, _F, _As, Info} | _]) ->
+    #{cause := Cause} = proplists:get_value(error_info, Info, #{}),
+    Cause.
+
 
 %%-------------------------------------------------------------------
 %% NIF stubs

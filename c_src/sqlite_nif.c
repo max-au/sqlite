@@ -37,6 +37,7 @@ static ERL_NIF_TERM am_undefined;
 static ERL_NIF_TERM am_position;
 static ERL_NIF_TERM am_out_of_memory;   /* out of memory */
 static ERL_NIF_TERM am_sqlite_error;    /* sqlite-specific error code */
+static ERL_NIF_TERM am_blob;
 
 /* database open modes */
 static ERL_NIF_TERM am_mode;
@@ -58,8 +59,8 @@ static ERL_NIF_TERM am_update;
 static ERL_NIF_TERM am_delete;
 
 /* connection status atoms */
-static ERL_NIF_TERM am_lookaside;
-static ERL_NIF_TERM am_cache;
+static ERL_NIF_TERM am_lookaside_memory;
+static ERL_NIF_TERM am_pager_cache_memory;
 static ERL_NIF_TERM am_schema;
 static ERL_NIF_TERM am_statement;
 static ERL_NIF_TERM am_deferred_fks;
@@ -470,7 +471,8 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
     double double_val;
     ErlNifBinary bin;
     ERL_NIF_TERM param, result;
-    int ret, column = 1;
+    const ERL_NIF_TERM* tuple;
+    int ret, column = 1, arity;
     int expected = sqlite3_bind_parameter_count(stmt);
 
     /* bind parameters passed */
@@ -483,22 +485,22 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
             /* NULL */
             ret = sqlite3_bind_null(stmt, column);
         } else if (enif_inspect_iolist_as_binary(env, param, &bin)) {
-            /* binary blob */
-            ret = sqlite3_bind_text64(stmt, column, (char*)bin.data, bin.size, SQLITE_TRANSIENT, SQLITE_UTF8);
+            /* TEXT */
+            ret = sqlite3_bind_text64(stmt, column, (char*)bin.data, bin.size, SQLITE_STATIC, SQLITE_UTF8);
         } else if (enif_is_number(env, param)) {
-            /* integer or float */
-            if (enif_get_int64(env, param, &int_val)) {
+            /* INTEGER or FLOAT */
+            if (enif_get_int64(env, param, &int_val))
                 ret = sqlite3_bind_int64(stmt, column, int_val);
-            } else if (enif_get_double(env, param, &double_val))
+            else if (enif_get_double(env, param, &double_val))
                 ret = sqlite3_bind_double(stmt, column, double_val);
-            else {
+            else
                 return make_extended_error_ex(env, am_badarg, "failed to bind parameter", arg_index, "bignum not supported",
                     NULL, column);
-            }
-        } else {
+        } else if (enif_get_tuple(env, param, &arity, &tuple) && (tuple[0] == am_blob) && (enif_inspect_binary(env, tuple[1], &bin))) {
+            ret = sqlite3_bind_blob64(stmt, column, (char*)bin.data, bin.size, SQLITE_STATIC);
+        } else
             return make_extended_error_ex(env, am_badarg, "failed to bind parameter", arg_index, "unsupported type",
                 NULL, column);
-        }
 
         if (ret != SQLITE_OK) {
             const char* sql_error = sqlite3_errstr(ret);
@@ -540,7 +542,6 @@ static ERL_NIF_TERM bind_and_execute(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF
                         case SQLITE_TEXT:
                             size = sqlite3_column_bytes(stmt, i);
                             const char* text = (const char*)sqlite3_column_text(stmt, i);
-                            /* TODO: decide between binary and the Erlang string */
                             values[i] = make_binary(env, text, size);
                             break;
                         case SQLITE_INTEGER:
@@ -910,8 +911,8 @@ static ERL_NIF_TERM sqlite_status_nif(ErlNifEnv *env, int argc, const ERL_NIF_TE
     db_cur_stat(SQLITE_DBSTATUS_DEFERRED_FKS, am_deferred_fks, status);
 
     /* now build the result */
-    enif_make_map_put(env, status, am_lookaside, lookaside, &status);
-    enif_make_map_put(env, status, am_cache, cache, &status);
+    enif_make_map_put(env, status, am_lookaside_memory, lookaside, &status);
+    enif_make_map_put(env, status, am_pager_cache_memory, cache, &status);
 
     enif_mutex_unlock(conn->mutex);
 
@@ -1052,9 +1053,9 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM load_info)
     am_badarg = enif_make_atom(env, "badarg");
     am_undefined = enif_make_atom(env, "undefined");
     am_position = enif_make_atom(env, "position");
-
     am_out_of_memory = enif_make_atom(env, "out_of_memory");
     am_sqlite_error = enif_make_atom(env, "sqlite_error");
+    am_blob = enif_make_atom(env, "blob");
 
     am_mode = enif_make_atom(env, "mode");
     am_flags = enif_make_atom(env, "flags");
@@ -1073,8 +1074,8 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM load_info)
     am_update = enif_make_atom(env, "update");
     am_delete = enif_make_atom(env, "delete");
 
-    am_lookaside = enif_make_atom(env, "lookaside");
-    am_cache = enif_make_atom(env, "cache");
+    am_lookaside_memory = enif_make_atom(env, "lookaside_memory");
+    am_pager_cache_memory = enif_make_atom(env, "pager_cache_memory");
     am_schema = enif_make_atom(env, "schema");
     am_statement = enif_make_atom(env, "statement");
     am_deferred_fks = enif_make_atom(env, "deferred_fks");
