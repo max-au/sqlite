@@ -2,34 +2,23 @@
 C_SRC_DIR := $(shell pwd)
 PROJECT_DIR := $(abspath $(C_SRC_DIR)/..)
 
-# Figure out OS-specific details: library extension
-ifeq ($(OS),Windows_NT)
-	TARGET := $(PROJECT_DIR)/priv/sqlite.dll
-else
-	TARGET := $(PROJECT_DIR)/priv/sqlite.so
-	UNAME_SYS := $(shell uname -s)
+# Figure out Unix-specific details: library extension
+TARGET := $(PROJECT_DIR)/priv/sqlite.so
+UNAME_SYS := $(shell uname -s)
 
-	ifeq ($(UNAME_SYS), Darwin)
-		CC ?= cc
-		LDFLAGS ?= -flat_namespace -undefined suppress
-	else ifeq ($(UNAME_SYS), FreeBSD)
-		CC ?= cc
-	else ifeq ($(UNAME_SYS), Linux)
-		CC ?= gcc
-	endif
+ifeq ($(UNAME_SYS), Darwin)
+	CC ?= cc
+	LDFLAGS ?= -undefined dynamic_lookup
+else ifeq ($(UNAME_SYS), FreeBSD)
+	CC ?= cc
+else ifeq ($(UNAME_SYS), Linux)
+	CC ?= gcc
 endif
 
-# Figure out Erlang Library paths.
-# Do a single call to "erl" printing all the information, and split it in words later.
-# This saves quite an amount of time spawning extra BEAMs
-DIRS = $(shell erl -noshell -eval "io:format(\"~ts/erts-~ts/include/~n~ts~n~ts\", [code:root_dir(), erlang:system_info(version), code:lib_dir(erl_interface, include), code:lib_dir(erl_interface, lib)])." -s init stop)
+# Erlang NIF includes
+ERTS_INCLUDE_DIR = $(shell erl -noshell -eval "io:format(\"~ts/erts-~ts/include/\", [code:root_dir(), erlang:system_info(version)])." -s init stop)
 
-ERTS_INCLUDE_DIR ?= $(word 1, $(DIRS))
-ERL_INTERFACE_INCLUDE_DIR ?= $(word 2, $(DIRS))
-ERL_INTERFACE_LIB_DIR ?= $(word 3, $(DIRS))
-
-CFLAGS += -std=c99 -finline-functions -Wall -Wmissing-prototypes -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR)
-LDLIBS += -L $(ERL_INTERFACE_LIB_DIR) -lei
+CFLAGS += -std=c99 -finline-functions -Wall -Wmissing-prototypes -fPIC -I $(ERTS_INCLUDE_DIR)
 
 # Set up DEBUG flags if DEBUG environment variable is set
 # The "variable trick" below allows using "DEBUG=1"

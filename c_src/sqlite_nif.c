@@ -321,7 +321,7 @@ static ERL_NIF_TERM sqlite_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     ErlNifBinary fn_bin;
     ERL_NIF_TERM mode, flag;
     int v2flags = 0;
-    long busy_timeout = -1;
+    ErlNifSInt64 busy_timeout = -1;
 
     /* type checks */
     if (!enif_is_map(env, argv[1]))
@@ -525,12 +525,11 @@ static ERL_NIF_TERM bind(ErlNifEnv *env, sqlite3_stmt* stmt, ERL_NIF_TERM params
     return THE_NON_VALUE;
 }
 
-static ERL_NIF_TERM fetch_row(ErlNifEnv *env, sqlite3_stmt* stmt, int column_count) {
+static ERL_NIF_TERM fetch_row(ErlNifEnv *env, sqlite3_stmt* stmt, int column_count, ERL_NIF_TERM values[]) {
     int column_type;
     unsigned int size;
     ErlNifSInt64 int_val;
     double double_val;
-    ERL_NIF_TERM values[column_count]; /* FIXME: C99 supports this via alloca(), but is that safe enough? */
     for (int i=0; i<column_count; i++) {
         column_type = sqlite3_column_type(stmt, i);
         switch (column_type) {
@@ -560,18 +559,29 @@ static ERL_NIF_TERM fetch_row(ErlNifEnv *env, sqlite3_stmt* stmt, int column_cou
     return enif_make_tuple_from_array(env, values, column_count);
 }
 
+/* fetching a row with over 256 columns is slow anyway, so memory allocation is not an issue there */
+#define COLUMNS_ON_STACK    256
+
 /* runs the query with pre-bound arguments */
 static ERL_NIF_TERM execute(ErlNifEnv *env, sqlite3_stmt* stmt) {
-    ERL_NIF_TERM row, result = enif_make_list(env, 0);
+    ERL_NIF_TERM next_row, result = enif_make_list(env, 0);
     int column_count = sqlite3_column_count(stmt);
+
+    ERL_NIF_TERM values_buffer[COLUMNS_ON_STACK];
+    ERL_NIF_TERM* row = &values_buffer[0];
+    if (column_count > 512)
+        row = (ERL_NIF_TERM*)enif_alloc(column_count * sizeof(ERL_NIF_TERM));
+    else 
+        row = &values_buffer[0];
+
     int ret = sqlite3_step(stmt);
     switch (ret) {
         case SQLITE_DONE:
             break;
         case SQLITE_ROW:
             do {
-                row = fetch_row(env, stmt, column_count);
-                result = enif_make_list_cell(env, row, result);
+                next_row = fetch_row(env, stmt, column_count, row);
+                result = enif_make_list_cell(env, next_row, result);
                 ret = sqlite3_step(stmt);
             } while (ret == SQLITE_ROW);
             /* check if it was error that bailed out */
@@ -582,6 +592,9 @@ static ERL_NIF_TERM execute(ErlNifEnv *env, sqlite3_stmt* stmt) {
             result = make_generic_sqlite_error(env, ret, "error running query");
             break;
     }
+
+    if (column_count > COLUMNS_ON_STACK)
+        enif_free(row);
 
     return result;
 }
@@ -710,7 +723,7 @@ static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     int ret;
     ERL_NIF_TERM result;
     sqlite3_stmt* sqlite_stmt = stmt->reference->statement;
-
+    int column_count = sqlite3_column_count(sqlite_stmt);
     if (steps == 1) {
         /* single step return */
         ret = sqlite3_step(sqlite_stmt);
@@ -722,7 +735,15 @@ static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
                 result = am_busy;
                 break;
             case SQLITE_ROW:
-                result = fetch_row(env, sqlite_stmt, sqlite3_column_count(sqlite_stmt));
+                ERL_NIF_TERM values_buffer[COLUMNS_ON_STACK];
+                ERL_NIF_TERM* row = &values_buffer[0];
+                if (column_count > 512)
+                    row = (ERL_NIF_TERM*)enif_alloc(column_count * sizeof(ERL_NIF_TERM));
+                else 
+                    row = &values_buffer[0];
+                result = fetch_row(env, sqlite_stmt, column_count, row);
+                if (column_count > COLUMNS_ON_STACK)
+                    enif_free(row);
                 break;
             default:
                 result = make_generic_sqlite_error(env, ret, "error running query");
@@ -730,10 +751,16 @@ static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         }
     } else {
         /* multi-step return - either [Row] list, or a tuple of {done|busy, [Row]}*/
+        ERL_NIF_TERM values_buffer[COLUMNS_ON_STACK];
+        ERL_NIF_TERM* row = &values_buffer[0];
+        if (column_count > 512)
+            row = (ERL_NIF_TERM*)enif_alloc(column_count * sizeof(ERL_NIF_TERM));
+        else 
+            row = &values_buffer[0];
+
         result = enif_make_list(env, 0);
         while (steps > 0) {
-            int column_count = sqlite3_column_count(sqlite_stmt);
-            ERL_NIF_TERM row;
+            ERL_NIF_TERM next_row;
             steps--;
             ret = sqlite3_step(sqlite_stmt);
             switch (ret) {
@@ -746,8 +773,8 @@ static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
                     steps = 0;
                     break;
                 case SQLITE_ROW:
-                    row = fetch_row(env, sqlite_stmt, column_count);
-                    result = enif_make_list_cell(env, row, result);
+                    next_row = fetch_row(env, sqlite_stmt, column_count, row);
+                    result = enif_make_list_cell(env, next_row, result);
                     break;
                 default:
                     result = make_generic_sqlite_error(env, ret, "error running query");
@@ -755,6 +782,8 @@ static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
                     break;
             }
         }
+        if (column_count > COLUMNS_ON_STACK)
+            enif_free(row);
     }
 
     enif_mutex_unlock(stmt->connection->mutex);

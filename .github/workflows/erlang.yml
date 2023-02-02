@@ -1,0 +1,44 @@
+name: Build, Test, Dialyze
+
+on:
+  pull_request:
+    types: [ opened, reopened, synchronize ]
+  push:
+    branches:
+      - 'master'
+
+jobs:
+  linux:
+    name: Test on OTP ${{ matrix.otp_version }} and ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        otp_version: [24, 25]
+        os: [ubuntu-latest]
+
+    container:
+      image: erlang:${{ matrix.otp_version }}
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run tests
+        run: rebar3 ct
+      - name: Documentation
+        run: rebar3 edoc
+      - name: ExDoc Documentation
+        run: if [ $(rebar3 version | awk '{print $5}') -gt 23 ]; then rebar3 ex_doc; fi;
+      - shell: bash
+        name: Dialyzer
+        run: rebar3 dialyzer
+
+  macos:
+    name: Test on MacOS
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Erlang
+        run: brew install erlang rebar3
+      - name: Run tests
+        run: rebar3 ct

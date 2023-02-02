@@ -405,13 +405,13 @@ concurrency(Config) when is_list(Config) ->
     [] = sqlite:query(Db, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
     sqlite:close(Db),
     %% share a connection (and prepared statements) between many workers using ETS
-    Workers = [erlang:spawn_link(fun() -> worker(Seq, FileName) end) || Seq <- lists:seq(1, Concurrency)],
+    Workers = [erlang:spawn_link(fun() -> worker(rand:seed(exrop, {Seq, 0, 0}), FileName) end) || Seq <- lists:seq(1, Concurrency)],
     Monitors = [{W, erlang:monitor(process, W)} || W <- Workers],
     %% wait for all of them to complete (with no error, otherwise the link crashes test runner)
     [receive {'DOWN', Mon, process, Pid, Reason} -> Reason end || {Pid, Mon} <- Monitors].
 
-worker(Seq, FileName) ->
-    worker(500, Seq, sqlite:open(FileName, #{busy_timeout => 60000, mode => read_write}), FileName, []).
+worker(Seed, FileName) ->
+    worker(500, Seed, sqlite:open(FileName, #{busy_timeout => 60000, mode => read_write}), FileName, []).
 
 %% Possible actions:
 %%  * open/close a DB
@@ -421,32 +421,32 @@ worker(Seq, FileName) ->
 worker(0, _Seed, _Db, _FileName, _Statements) ->
     ok;
 worker(Count, Seed, Db, FileName, Statements) ->
-    Next = rand:mwc59(Seed),
-    case Next rem 80 of
+    {Next, NewSeed} = rand:uniform_s(80, Seed),
+    case Next of
         0 ->
             ok = sqlite:close(Db),
             NewDb = sqlite:open(FileName, #{busy_timeout => 60000, mode => read_write}),
-            worker(Count - 1, Next, NewDb, FileName, []);
+            worker(Count - 1, NewSeed, NewDb, FileName, []);
         NewStatement when NewStatement < 10 ->
             try
                 Prep = sqlite:prepare(Db, "INSERT INTO kv (val) VALUES (?1)", #{persistent => true}),
-                worker(Count - 1, Next, Db, FileName, [Prep | Statements])
+                worker(Count - 1, NewSeed, Db, FileName, [Prep | Statements])
             catch
                 TX:TY ->
                     io:format(user, "prepare: ~s:~p~n", [TX, TY]),
-                    worker(Count, Next, Db, FileName, Statements)
+                    worker(Count, NewSeed, Db, FileName, Statements)
             end;
         DelStatement when DelStatement < 20, length(Statements) > 0 ->
             NewStmts = lists:droplast(Statements),
-            worker(Count - 1, Next, Db, FileName, NewStmts);
+            worker(Count - 1, NewSeed, Db, FileName, NewStmts);
         _RunStatement when length(Statements) > 0 ->
             try sqlite:execute(hd(Statements), [1])
             catch X:Y -> io:format(user, "exec: ~s:~p~n", [X, Y])
             end,
-            worker(Count - 1, Next, Db, FileName, Statements);
+            worker(Count - 1, NewSeed, Db, FileName, Statements);
         _RunStatement ->
             %% skipping a step
-            worker(Count, Next, Db, FileName, Statements)
+            worker(Count, NewSeed, Db, FileName, Statements)
     end.
 
 race_close_prepare() ->

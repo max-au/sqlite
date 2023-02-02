@@ -14,9 +14,16 @@ amalgamation. Specify `USE_SYSTEM_SQLITE` environment variable to
 build against sqlite version provided by the system (tested with
 sqlite 3.37.2 and newer).
 
+sqlite3 amalgamation build flags are accepted through `CFLAGS`, e.g.
+`CFLAGS="-DSQLITE_USE_URI" rebar3 compile`.
+
 For a debug build, specify `DEBUG=1` environment variable. Both
 NIF bindings and sqlite amalgamation files are affected by this flag. Remember
 to run `rebar3 clean` when changing build flavour.
+
+Requires OTP 24 and above (older versions do not support extended error
+specification per EEP-54). Find a list of supported Operating Systems in
+the corresponding section.
 
 ## Quick start
 The easiest way to try it out is to run `rebar3 shell` within the cloned
@@ -64,6 +71,34 @@ perf script | ./stackcollapse-perf.pl > out.perf-folded
 ./flamegraph.pl out.perf-folded > perf.svg
 ```
 
+## Operating system support
+Initial version has been tested on Linux (Ubuntu), Mac OS, FreeBSD 13 and
+Windows 10.
+
+### Mac OS
+If you see Apple Silicon (ARM64) build failing with this diagnostic:
+```
+Undefined symbols for architecture arm64:
+  "_enif_alloc", referenced from:
+```
+Clear the `LDFLAGS` variable with `unset LDFLAGS` and try again.
+
+### Windows
+Windows build, with `rebar3` as an escript, assuming Ericsson official installation
+into `C:\Program Files\Erlang OTP`. If you have it elsewhere, set `ERTS_INCLUDE_DIR`
+environment variable appropriately, to the `usr/include` subfolder of your installation.
+
+Build requires `x64 Native Tools Command Prompt`. Tested with VS 2022. Ensure
+to see the slogan: `[vcvarsall.bat] Environment initialized for: 'x64'`
+
+```
+# set up PATH to escript/erl
+set PATH=%PATH%;C:\Program Files\Erlang OTP\bin
+# download or build rebar3 (assuming it is now in the current directory)
+# use rebar3 to build sqlite and run Common Test
+escript.exe rebar3 ct
+```
+
 ## Anticipated changes beyond 1.0
 These features did not make it into 1.0, but are useful and may be implemented
 in the following releases:
@@ -76,10 +111,10 @@ in the following releases:
 * large blob handling
 * sqlite vfs support (with Erlang distribution)
 * database serialisation (sqlite3_serialize)
-
+* improved performance for concurrent access to the same connection/statement,
+  running on a normal scheduler and yielding
 
 ## TODO: LIST OF THINGS TO BE DONE BEFORE RELEASE
-* Mac OS: figure out why static build loads sqlite from 
-* OS support (Linux, MacOS, Windows, FreeBSD)
-* performance: concurrent access to the same connection/statement (locking), try to run on a normal scheduler
+* setup CI on GitHub
+* rename to sqlite3
 * possible ERTS bug: when the process holding RESOURCE reference exits, destructor is not called

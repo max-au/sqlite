@@ -1,0 +1,32 @@
+LDFLAGS = /DLL
+
+!if "$(DEBUG)" == "1"
+CFLAGS= $(CFLAGS) /MDd
+!else
+CFLAGS= $(CFLAGS) /MD /O2
+!endif
+
+C_SRC = c_src
+TARGET = priv\sqlite.dll
+
+!ifndef ERTS_INCLUDE_DIR
+ERTS_INCLUDE_DIR = C:\Program Files\Erlang OTP\usr\include
+!endif
+
+CFLAGS = $(CFLAGS) /I"$(ERTS_INCLUDE_DIR)"
+
+# Do not use system-provided sqlite on Windows
+OBJ = $(C_SRC)\sqlite3.obj $(C_SRC)\sqlite_nif.obj
+
+all: $(TARGET)
+
+$(TARGET): $(OBJ)
+	link $(LDFLAGS) $** /OUT:$@
+
+.c.obj:
+    cl /c $(CFLAGS) /Fo$*.obj $*.c
+
+
+clean:
+	@del /f /q $(C_SRC)\*.obj
+	@del /f /q priv\sqlite.*
