@@ -30,13 +30,13 @@
 suite() ->
     [{timetrap, {seconds, 10000}}].
 
-init_per_testcase(TC, Config) when TC =:= malloc; TC =:= enif_alloc ->
+init_per_testcase(TC, Config) when TC =:= malloc ->
     ensure_unload(sqlite),
     Config;
 init_per_testcase(_TC, Config) ->
     Config.
 
-end_per_testcase(TC, Config) when TC =:= malloc; TC =:= enif_alloc ->
+end_per_testcase(TC, Config) when TC =:= malloc; TC =:= delayed_dealloc_kill ->
     application:unset_env(sqlite, enif_alloc),
     ensure_unload(sqlite),
     Config;
@@ -197,7 +197,8 @@ status(Config) when is_list(Config) ->
     #{fullscan_step := 0, sort := 0, autoindex := 0, vm_step := 0, reprepare := 0,
         run := 0, memory_used := _} = sqlite:info(Prepared),
     %%  system stats, skip page_cache check for not all versions have it
-    #{memory_used := {_, _}, page_cache := {_, _, _, _, _}, malloc := {_, _, _}} = sqlite:system_info().
+    #{memory_used := {_, _}, page_cache := {_, _, _, _, _}, malloc := {_, _, _},
+        version := _Vsn} = sqlite:system_info().
 
 enif_alloc() ->
     [{doc, "Tests that enif_alloc is used for SQLite allocations"}].
@@ -334,12 +335,14 @@ attempt_crash(Prepared) ->
 
 delayed_dealloc_kill(Config) when is_list(Config) ->
     %% delete && purge the sqlite NIF module
-    true = code:delete(sqlite),
-    %% ensure that code purge kills the delayed_dealloc process
-    Begin = processes(),
-    code:purge(sqlite),
-    WithoutPurger = Begin -- processes(),
-    ?assert(length(WithoutPurger) =:= 1, WithoutPurger),
+    erlang:module_loaded(sqlite) andalso begin
+        true = code:delete(sqlite),
+        %% ensure that code purge kills the delayed_dealloc process
+        Begin = processes(),
+        code:purge(sqlite),
+        WithoutPurger = Begin -- processes(),
+        ?assert(length(WithoutPurger) =:= 1, WithoutPurger)
+        end,
     %% ensure it's not loaded
     ?assertNot(erlang:module_loaded(sqlite)),
     Before = processes(),

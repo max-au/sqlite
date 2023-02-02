@@ -79,7 +79,7 @@ in the following releases:
 
 
 ## TODO: LIST OF THINGS TO BE DONE BEFORE RELEASE
-* performance - concurrent access to the same connection/statement (locking efficiency)
-* performance - see what can run on normal scheduler (yielding?)
+* Mac OS: figure out why static build loads sqlite from 
 * OS support (Linux, MacOS, Windows, FreeBSD)
-* POTENTIAL ERTS BUG: when the process holding RESOURCE reference exits, no destructor is called
+* performance: concurrent access to the same connection/statement (locking), try to run on a normal scheduler
+* possible ERTS bug: when the process holding RESOURCE reference exits, destructor is not called

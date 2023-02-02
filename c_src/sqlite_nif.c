@@ -12,7 +12,7 @@
 #include "./sqlite3.h"
 #endif
 
-#ifdef NO_SQLITE3_ERROR_OFFSET
+#if SQLITE_VERSION_NUMBER < 3038000
 static int sqlite3_error_offset(sqlite3 *db) {return -1;}
 #endif
 
@@ -94,6 +94,7 @@ static ERL_NIF_TERM am_memory_used;
 /* system info atoms */
 static ERL_NIF_TERM am_page_cache;
 static ERL_NIF_TERM am_malloc;
+static ERL_NIF_TERM am_version;
 
 /* forward definitions (linked list) */
 typedef struct statement_t statement_t;
@@ -561,14 +562,13 @@ static ERL_NIF_TERM fetch_row(ErlNifEnv *env, sqlite3_stmt* stmt, int column_cou
 
 /* runs the query with pre-bound arguments */
 static ERL_NIF_TERM execute(ErlNifEnv *env, sqlite3_stmt* stmt) {
-    ERL_NIF_TERM result = enif_make_list(env, 0);
+    ERL_NIF_TERM row, result = enif_make_list(env, 0);
+    int column_count = sqlite3_column_count(stmt);
     int ret = sqlite3_step(stmt);
     switch (ret) {
         case SQLITE_DONE:
             break;
         case SQLITE_ROW:
-            int column_count = sqlite3_column_count(stmt);
-            ERL_NIF_TERM row;
             do {
                 row = fetch_row(env, stmt, column_count);
                 result = enif_make_list_cell(env, row, result);
@@ -631,7 +631,7 @@ static ERL_NIF_TERM sqlite_prepare_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
         return make_badarg(env, NULL, 1, "connection closed");
     }
 
-    int ret = sqlite3_prepare_v2(conn->connection, (char*)query_bin.data, query_bin.size, &stmt, NULL);
+    int ret = sqlite3_prepare_v3(conn->connection, (char*)query_bin.data, query_bin.size, prep_flags, &stmt, NULL);
     if (ret != SQLITE_OK) {
         enif_mutex_unlock(conn->mutex);
         enif_release_resource(stmt_res);
@@ -942,6 +942,7 @@ static ERL_NIF_TERM sqlite_interrupt_nif(ErlNifEnv *env, int argc, const ERL_NIF
 static ERL_NIF_TERM sqlite_system_info_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
     ERL_NIF_TERM info = enif_make_new_map(env);
+    const char* vsn;
     sqlite3_int64 cur, hw, page_cur, page_hw, page, undef;
 
     if (sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &cur, &hw, 0) == SQLITE_OK) {
@@ -963,6 +964,11 @@ static ERL_NIF_TERM sqlite_system_info_nif(ErlNifEnv *env, int argc, const ERL_N
             enif_make_int64(env, cur), enif_make_int64(env, hw));
         enif_make_map_put(env, info, am_malloc, tuple, &info);
     }
+    
+    /* sqlite version */
+    vsn = sqlite3_libversion();
+    enif_make_map_put(env, info, am_version, make_binary(env, vsn, strlen(vsn)), &info);
+
     return info;
 }
 
@@ -1092,8 +1098,8 @@ static ErlNifFunc nif_funcs[] = {
 
 
 /* memory management */
-static int sqlmem_init(void*) {return 0;}
-static void sqlmem_shutdown(void*) {}
+static int sqlmem_init(void* unused) {return 0;}
+static void sqlmem_shutdown(void* unused) {}
 
 static void* sqlmem_alloc(int size)
 {
@@ -1224,6 +1230,7 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM load_info)
 
     am_page_cache = enif_make_atom(env, "page_cache");
     am_malloc = enif_make_atom(env, "malloc");
+    am_version = enif_make_atom(env, "version");
 
     ErlNifResourceType *rt;
     rt = enif_open_resource_type(env, NULL, "sqlite_connection", sqlite_connection_destroy, ERL_NIF_RT_CREATE, NULL);

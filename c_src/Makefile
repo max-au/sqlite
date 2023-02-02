@@ -29,7 +29,7 @@ ERL_INTERFACE_INCLUDE_DIR ?= $(word 2, $(DIRS))
 ERL_INTERFACE_LIB_DIR ?= $(word 3, $(DIRS))
 
 CFLAGS += -std=c99 -finline-functions -Wall -Wmissing-prototypes -fPIC -I $(ERTS_INCLUDE_DIR) -I $(ERL_INTERFACE_INCLUDE_DIR)
-LDLIBS += -L $(ERL_INTERFACE_LIB_DIR) -lei -lsqlite3
+LDLIBS += -L $(ERL_INTERFACE_LIB_DIR) -lei
 
 # Set up DEBUG flags if DEBUG environment variable is set
 # The "variable trick" below allows using "DEBUG=1"
@@ -46,7 +46,8 @@ LDFLAGS += -shared
 #SRC := $(shell find $(C_SRC_DIR) -type f \( -name "*.c" \))
 ifdef USE_SYSTEM_SQLITE
     SRC := ${C_SRC_DIR}/sqlite_nif.c
-    CFLAGS += -DUSE_SYSTEM_SQLITE -DNO_SQLITE3_ERROR_OFFSET
+    CFLAGS += -DUSE_SYSTEM_SQLITE
+    LDLIBS += -lsqlite3
 else
 	# SQLite amalgamation is a part of this project, but it's possible
 	#  that someone wants to use the system-provided one

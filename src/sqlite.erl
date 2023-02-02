@@ -185,7 +185,8 @@ nif_stub_error(Line) ->
 -type system_info() :: #{
     memory_used => {Cur :: integer(), Max :: integer()},
     page_cache => {Size :: integer(), Used :: integer(), Max :: integer(), Overflow :: integer(), OverflowMax :: integer()},
-    malloc => {Size :: integer(), Count :: integer(), Max :: integer()}
+    malloc => {Size :: integer(), Count :: integer(), Max :: integer()},
+    version => binary()
 }.
 %% Status information about the performance of SQLite
 %%
