@@ -734,7 +734,7 @@ static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
             case SQLITE_BUSY:
                 result = am_busy;
                 break;
-            case SQLITE_ROW:
+            case SQLITE_ROW: {
                 ERL_NIF_TERM values_buffer[COLUMNS_ON_STACK];
                 ERL_NIF_TERM* row = &values_buffer[0];
                 if (column_count > 512)
@@ -744,7 +744,7 @@ static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
                 result = fetch_row(env, sqlite_stmt, column_count, row);
                 if (column_count > COLUMNS_ON_STACK)
                     enif_free(row);
-                break;
+                break;}
             default:
                 result = make_generic_sqlite_error(env, ret, "error running query");
                 break;

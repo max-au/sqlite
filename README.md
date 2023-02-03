@@ -113,8 +113,3 @@ in the following releases:
 * database serialisation (sqlite3_serialize)
 * improved performance for concurrent access to the same connection/statement,
   running on a normal scheduler and yielding
-
-## TODO: LIST OF THINGS TO BE DONE BEFORE RELEASE
-* setup CI on GitHub
-* rename to sqlite3
-* possible ERTS bug: when the process holding RESOURCE reference exits, destructor is not called
