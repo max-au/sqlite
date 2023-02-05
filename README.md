@@ -99,17 +99,19 @@ set PATH=%PATH%;C:\Program Files\Erlang OTP\bin
 escript.exe rebar3 ct
 ```
 
-## Anticipated changes beyond 1.0
+## Missing Features for 1.0
+* online backup support
+* do "trylock" and then reschedule instead of dirty NIF from the beginning
+* yielding busy handler (instead of consuming dirty I/O scheduler)
+* asynchronous `query` and `execute` APIs (with message exchange on return)
+* add diagnostic routines to enumerate prepared statements/statements running
+
+## Features beyond 1.0
 These features did not make it into 1.0, but are useful and may be implemented
 in the following releases:
-* online backup support
-* alphanumeric identifiers (non-positional) for bindings in prepared statements
-* support for atom() and map() type conversion
-* asynchronous `query` and `execute` APIs (with message exchange on return)
-* sqlite hooks support (commit, preupdate, rollback, update, wal)
-* snapshot support
-* large blob handling
-* sqlite vfs support (with Erlang distribution)
-* database serialisation (sqlite3_serialize)
+* non-experimental sqlite hooks support (commit, preupdate, rollback, update, wal)
+* sqlite snapshot, vfs, blob and serialization support
 * improved performance for concurrent access to the same connection/statement,
   running on a normal scheduler and yielding
+* support for atom() and map() type conversion
+* named parameters with '@' and Tcl syntax

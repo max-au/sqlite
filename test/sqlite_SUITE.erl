@@ -17,11 +17,11 @@
     race_close_prepare/0, race_close_prepare/1,
     enif_alloc/0, enif_alloc/1,
     malloc/0, malloc/1,
+    backup/1,
+    named_parameters/0, named_parameters/1,
     prepared/1, errors/1, monitor/1,
     concurrency/0, concurrency/1,
     delayed_dealloc_kill/1]).
-
--export([benchmark_prepared/1]).
 
 -behaviour(ct_suite).
 
@@ -46,11 +46,10 @@ end_per_testcase(_TC, Config) ->
 all() ->
     [basic, bind_step, shared, shared_cache, interrupt, crash, types, close, status,
         enif_alloc, prepared, errors, monitor, concurrency, race_close_prepare,
-        delayed_dealloc_kill, malloc].
+        delayed_dealloc_kill, malloc, backup].
 
 %%-------------------------------------------------------------------
 %% Convenience functions
--define(QUERY, "SELECT * FROM kv WHERE key=?1").
 
 ensure_unload(Mod) ->
     erlang:module_loaded(Mod) andalso
@@ -163,6 +162,10 @@ types(Config) when is_list(Config) ->
     ?assertExtended(error, badarg,
         #{cause => #{2 => <<"bignum not supported">>, position => 1, general => <<"failed to bind parameter">>}},
         sqlite:execute(PreparedInt, [18446744073709551615])),
+    %% type error takes precedence over invalid column error
+    ?assertExtended(error, badarg,
+        #{cause => #{2 => <<"bignum not supported">>, position => 2, general => <<"failed to bind parameter">>}},
+        sqlite:execute(PreparedInt, #{2 => 18446744073709551615})),
     %% FLOAT storage class
     PreparedFloat = sqlite:prepare(Conn, "INSERT INTO types (f1) VALUES ($1)"),
     Pi = math:pi(),
@@ -213,9 +216,15 @@ enif_alloc(Config) when is_list(Config) ->
     %% test that erlang:memory() reflects changes when large allocations are done
     Before = erlang:memory(system),
     [[] = sqlite:execute(Statement, [Seq, Bin]) || Seq <- lists:seq(1, Repeats)],
-    Diff = erlang:memory(system) - Before,
+    After = erlang:memory(system),
+    Diff = After - Before,
     %% system memory should grow ~2x of the binding size
-    ?assert(Diff > BinSize andalso Diff < (3 * BinSize), {difference, Diff, byte_size, BinSize}).
+    ?assert(Diff > BinSize andalso Diff < (3 * BinSize), {difference, Diff, byte_size, BinSize}),
+    %% finalise the statement - release some sqlite memory (but keep some of NIF resources)
+    ok = sqlite:finish(Statement),
+    Diff2 = erlang:memory(system) - After,
+    %% just a bit of slack
+    ?assert(Diff2 < 0, {not_final, Diff2}).
 
 malloc() ->
     [{doc, "Tests that malloc is used for SQLite allocations"}].
@@ -241,6 +250,35 @@ prepared(Config) when is_list(Config) ->
     %% test statement into
     ?assertEqual([{<<"key">>,<<"INTEGER">>},{<<"val">>,<<"TEXT">>}], sqlite:describe(PreparedSel)).
 
+named_parameters() ->
+    [{doc, "Tests that named parameters map is accepted"}].
+
+named_parameters(Config) when is_list(Config) ->
+    Conn = sqlite:open("", #{flags => [memory]}),
+    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER, val TEXT) STRICT"),
+    Prep = sqlite:prepare(Conn, "INSERT INTO kv (key, val) VALUES (:key, :value)"),
+    %% test extended errors
+    ?assertExtended(error, badarg, #{cause => #{2 => <<"parameter not found">>, general => <<":wrong">>}},
+        sqlite:bind(Prep, #{wrong => 1})),
+    ?assertExtended(error, {sqlite_error,25}, #{cause => #{2 => <<"column index out of range">>, position => 4,
+        general => <<"failed to bind parameter">>}}, sqlite:bind(Prep, #{4 => "err"})),
+    %%
+    [] = sqlite:execute(Prep, #{key => 1, value => "text"}),
+    [] = sqlite:execute(Prep, #{key => 2, value => "text2"}),
+    [{1, <<"text">>}] = sqlite:query(Conn, "SELECT * FROM kv WHERE key = :col", #{<<"col">> => 1}),
+    %% now try partial bindings - with some bits left from previous run
+    ok = sqlite:reset(Prep),
+    ok = sqlite:clear(Prep),
+    ok = sqlite:bind(Prep, #{value => "two"}), %% key is unbound
+    done = sqlite:step(Prep),
+    ok = sqlite:reset(Prep),
+    %% try using positional syntax for map binding
+    ok = sqlite:bind(Prep, #{1 => 123}), %% now both key and value are bound
+    done = sqlite:step(Prep),
+    %% ensure we have all expected rows
+    ?assertEqual([{1, <<"text">>}, {2, <<"text2">>}, {undefined, <<"two">>}, {123, <<"two">>}],
+        sqlite:query(Conn, "SELECT * from kv")).
+
 bind_step() ->
     [{doc, "Tests bind/2 and step/1,2"}].
 
@@ -255,11 +293,18 @@ bind_step(Config) when is_list(Config) ->
     PreparedMultiInsert = sqlite:prepare(Conn, "INSERT INTO kv (val) VALUES (?1), (?), (?)"),
     ok = sqlite:bind(PreparedMultiInsert, ["2", "3", "4"]),
     {done, []} = sqlite:step(PreparedMultiInsert, 10),
+    %% reset and step again
+    ok = sqlite:reset(PreparedMultiInsert),
+    done = sqlite:step(PreparedMultiInsert), %% that's one statement, after all
+    %% clear bindings
+    ok = sqlite:clear(PreparedMultiInsert),
+    %% do not bind anything, but run the statement, which inserts 3 more rows with undefined value
+    done = sqlite:step(PreparedMultiInsert),
     %% select
     PreparedSelect = sqlite:prepare(Conn, "SELECT * FROM kv ORDER BY key"),
-    [{1, <<"str">>}, {2, <<"str">>}] = sqlite:step(PreparedSelect, 2),
-    [{3, <<"2">>}, {4, <<"3">>}] = sqlite:step(PreparedSelect, 2),
-    {done, [{5, <<"4">>}]} = sqlite:step(PreparedSelect, 10),
+    [{1, <<"str">>}, {2, <<"str">>}, {3, <<"2">>}, {4, <<"3">>}] = sqlite:step(PreparedSelect, 4),
+    [{5, <<"4">>}, {6, <<"2">>}, {7, <<"3">>}, {8, <<"4">>}] = sqlite:step(PreparedSelect, 4),
+    {done, [{9, undefined}, {10, undefined}, {11, undefined}]} = sqlite:step(PreparedSelect, 10),
     sqlite:close(Conn).
 
 monitor(Config) when is_list(Config) ->
@@ -292,34 +337,38 @@ interrupt() ->
     [{doc, "Tests that interrupt works, and hopefully not crashing the VM"}].
 
 interrupt(Config) when is_list(Config) ->
-    %% run 3 processes: one executes long query, another one interrupts
-    %% third process closes the connection...
     Conn = sqlite:open("", #{flags => [memory]}),
-    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT) STRICT"),
-    %% insert many rows many times
-    LongString = iolist_to_binary([<<"('1234567890ABCDEF'),">> || _ <- lists:seq(1, 128)]),
-    Insert = <<"INSERT INTO kv (val) VALUES ", LongString/binary, "('ok')">>,
-    [[] = sqlite:query(Conn, Insert) || _ <- lists:seq(1, 100)],
+    [] = sqlite:query(Conn, "CREATE TABLE any (val NOT NULL)"),
     %% now do the test
-    Long = spawn_link(fun () -> long_running(Conn) end),
-    Interrupt = spawn_link(fun () -> timer:sleep(10), sqlite:interrupt(Conn) end),
-    Close = spawn_link(fun () -> timer:sleep(10), sqlite:close(Conn) end),
-    %% do the actual test
-    Workers = [Long, Interrupt, Close],
-    Monitors = [{W, erlang:monitor(process, W)} || W <- Workers],
-    %% wait for all of them to complete (with no error, otherwise the link crashes test runner)
-    [receive {'DOWN', Mon, process, Pid, Reason} -> Reason end || {Pid, Mon} <- Monitors].
-
-long_running(Conn) ->
-    try
-        _ = sqlite:query(Conn, "SELECT key FROM kv WHERE val LIKE '%W%d%s'"),
-        long_running(Conn)
-    catch
-        error:{sqlite_error, 9} ->
-            ok;
-        error:badarg ->
-            ok %% connection closed is also expected
-    end.
+    Control = self(),
+    _Long = spawn_link(
+        fun () ->
+            Result =
+                try
+                    sqlite:query(Conn, "WITH RECURSIVE
+                    for(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM for WHERE i < 10000000)
+                    INSERT INTO any SELECT i FROM for")
+                catch
+                    error:Reason ->
+                        Reason
+                end,
+            Control ! {long, Result, os:system_time(millisecond)}
+        end),
+    timer:sleep(10), %% enough to get the Long process running
+    %% close will hang until the interrupt comes, so spawn an extra process for it
+    _Close = spawn_link(
+        fun () ->
+            sqlite:close(Conn),
+            Control ! {close, os:system_time(millisecond)}
+        end),
+    %% interrupt in the test process after 100 ms
+    timer:sleep(100),
+    ok = sqlite:interrupt(Conn),
+   %% get the interrupted & closing time (the latter must be greater)
+    InterruptedAt = receive {long, Result, IntTime} -> ?assertEqual({sqlite_error, 9}, Result), IntTime end,
+    %% get the closing time
+    ClosedAt = receive {close, CloseTime} -> CloseTime end,
+    ?assert(ClosedAt >= InterruptedAt, {interrupted, InterruptedAt, closed, ClosedAt, diff, ClosedAt - InterruptedAt}).
 
 crash(Config) when is_list(Config) ->
     %% ensures that even after GC prepared statement is working
@@ -368,25 +417,54 @@ alloc_some() ->
     Preps = [sqlite:prepare(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val STRING)") || _ <- lists:seq(1, 200)],
     {Conn, Preps}.
 
+backup(Config) when is_list(Config) ->
+    Src = sqlite:open("", #{flags => [memory]}),
+    Dst = sqlite:open("", #{flags => [memory]}),
+    sqlite:query(Src, "CREATE TABLE large (blob BLOB)"),
+    [] = sqlite:query(Src, "BEGIN;"),
+    [[] = sqlite:query(Src, "INSERT INTO large VALUES(randomblob(4072));") || _ <- lists:seq(1, 8)], %% 8 pages total
+    [] = sqlite:query(Src, "COMMIT;"),
+    %% do the basic backup
+    ok = sqlite:backup(Src, Dst),
+    ?assertEqual([{8}], [sqlite:query(Dst, "SELECT COUNT(*) FROM large")]),
+    %% do the fancier backup, with progress tracking, step setting etc.
+    Dst2 = sqlite:open("", #{flags => [memory]}),
+    try sqlite:backup(Src, Dst2, #{from => "main", step => 2, progress =>
+        fun (Prg, _Total) when Prg < 3 -> ok;
+            (Prg, _Total) when Prg < 5 -> {ok, 1};
+            (Prg, Total) -> throw({expected, Prg, Total})
+        end})
+    catch
+        throw:{expected, Progress, Total} ->
+            ?assertEqual(5, Progress),
+            ?assertEqual(8, Total)
+    end,
+    %% check backup interaction with close/1
+    ok.
+
 errors(Config) when is_list(Config) ->
     %% test EPP-54 extended error information
     ?assertExtended(error, badarg, #{cause => #{2 => <<"not a map">>}}, sqlite:open("", 123)),
     ?assertExtended(error, badarg, #{cause => #{2 => <<"unsupported mode">>}}, sqlite:open("", #{mode => invalid})),
-    ?assertExtended(error, {sqlite_error, 14}, #{cause => #{general => <<"error opening connection">>,
-        reason => <<"unable to open database file">>}},
+    ?assertExtended(error, {sqlite_error, 14}, #{cause =>
+        #{reason => <<"bad parameter or other API misuse">>, general => <<"unable to open database file">>}},
         sqlite:open("not_exist", #{mode => read_only})),
     %% need a statement for testing
     Db = sqlite:open("", #{flags => [memory]}),
     [] = sqlite:query(Db, "CREATE TABLE kv (key INTEGER PRIMARY KEY, val STRING)"),
+    %% non-existent table
+    ?assertExtended(error, {sqlite_error, 1},
+        #{cause => #{2 => <<"no such table: non_existing">>, general => <<"SQL logic error">>}},
+        sqlite:query(Db, "SELECT * from non_existing")),
     %% errors while preparing query
-    ?assertExtended(error, {sqlite_error, 1}, #{cause => #{general => <<"error preparing statement">>,
-        2 => <<"SQL logic error near column 30: \"WHERE\"">>, position => 30}},
+    ?assertExtended(error, {sqlite_error, 1}, #{cause =>
+        #{2 => <<"near \"WHERE\": syntax error">>,position => 30, general => <<"SQL logic error">>}},
         sqlite:query(Db, "SELECT * from kv ORDER BY key WHERE key = ?", [1])),
     ?assertExtended(error, badarg, #{cause => #{3 => <<"invalid persistent value">>}},
         sqlite:prepare(Db, "SELECT * from kv ORDER BY key", #{persistent => maybe})),
     %% extra binding when not expected
-    ?assertExtended(error, {sqlite_error,25},
-        #{cause => #{3 => <<"column index out of range">>, position => 2, general => <<"failed to bind parameter">>}},
+    ?assertExtended(error, {sqlite_error, 25}, #{cause =>
+        #{3 => <<"column index out of range">>,position => 2, general => <<"column index out of range">>}},
         sqlite:query(Db, "INSERT INTO kv (key) VALUES ($1)", [1, "1", 1])),
     %% not enough bindings
     ?assertExtended(error, badarg, #{cause => #{2 => <<"not enough parameters">>}},
@@ -473,47 +551,5 @@ do_race(Count) ->
 do_prepare(0, _Conn) ->
     ?assert(too_quick);
 do_prepare(Count, Conn) ->
-    try sqlite:prepare(Conn, ?QUERY), do_prepare(Count - 1, Conn)
+    try sqlite:prepare(Conn, <<"SELECT * FROM kv WHERE key=?1">>), do_prepare(Count - 1, Conn)
     catch error:badarg -> ok end.
-
-%% benchmark for prepared statements
-benchmark_prepared(Config) when is_list(Config) ->
-    measure_one(fun bench_query/2, "query"),
-    measure_one(fun bench_prep/2, "prepare every time"),
-    measure_one(fun bench_one/2, "prepare once").
-
-measure_one(FunTo, Kind) ->
-    Conn = sqlite:open("", #{flags => [memory]}),
-    [] = sqlite:query(Conn, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
-    [erlang:garbage_collect(Pid) || Pid <- processes()], %% ensure no garbage in the system
-    MemBefore = erlang:memory(system),
-    {TimeUs, _} = timer:tc(fun () -> FunTo(100000, Conn), erlang:garbage_collect() end),
-    MemDiff = erlang:memory(system) - MemBefore,
-    sqlite:close(Conn),
-    erlang:garbage_collect(),
-    MemZero = erlang:memory(system) - MemBefore,
-    ct:pal("~s: ~b ms, allocated ~b Kb (~b Kb)", [Kind, TimeUs div 1000, MemDiff div 1024, MemZero div 1024]),
-    {TimeUs, MemDiff}.
-
-bench_query(0, _Conn) ->
-    ok;
-bench_query(Count, Conn) ->
-    sqlite:query(Conn, ?QUERY, [1]),
-    bench_query(Count - 1, Conn).
-
-bench_prep(0, _Conn) ->
-    ok;
-bench_prep(Count, Conn) ->
-    Prep = sqlite:prepare(Conn, ?QUERY),
-    sqlite:execute(Prep, [1]),
-    bench_prep(Count - 1, Conn).
-
-bench_one(Count, Conn) ->
-    do_bench_one(Count, sqlite:prepare(Conn, ?QUERY)).
-
-do_bench_one(0, _Prep) ->
-   ok;
-do_bench_one(Count, Prep) ->
-    sqlite:execute(Prep, [1]),
-    do_bench_one(Count - 1, Prep).
-

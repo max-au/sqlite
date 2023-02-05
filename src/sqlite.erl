@@ -16,13 +16,18 @@
 %%% end.
 %%% '''
 %%% @end
+%%%
+%%% Extended errors: for SQL errors, "general" contains the error code text,
+%%%  and the detailed text is tied to an argument.
+%%%
 -module(sqlite).
 -author("maximfca@gmail.com").
 
 %% API
--export([open/1, open/2, close/1, status/1,
+-export([open/1, open/2, close/1, status/1, reset/1, clear/1, finish/1,
     query/2, query/3, prepare/2, prepare/3, bind/2, step/1, step/2, info/1, describe/1, execute/2,
-    monitor/1, demonitor/1, interrupt/1, system_info/0, get_last_insert_rowid/1
+    monitor/1, demonitor/1, interrupt/1, system_info/0, get_last_insert_rowid/1,
+    backup/2, backup/3
 ]).
 
 %% Internal export for erl_error formatter
@@ -30,10 +35,12 @@
 
 %% NIF loading code
 -on_load(init/0).
--nifs([sqlite_open_nif/2, sqlite_close_nif/1, sqlite_status_nif/1,
+-nifs([sqlite_open_nif/2, sqlite_close_nif/1, sqlite_status_nif/1, sqlite_reset_nif/1, sqlite_clear_nif/1,
     sqlite_query_nif/3, sqlite_prepare_nif/3, sqlite_bind_nif/2, sqlite_info_nif/1, sqlite_execute_nif/2,
     sqlite_step_nif/2, sqlite_monitor_nif/2, sqlite_describe_nif/1, sqlite_interrupt_nif/1,
-    sqlite_system_info_nif/0, sqlite_get_last_insert_rowid_nif/1, sqlite_dirty_close_nif/0]).
+    sqlite_system_info_nif/0, sqlite_get_last_insert_rowid_nif/1, sqlite_finish_nif/1,
+    sqlite_backup_init_nif/4, sqlite_backup_step_nif/2, sqlite_backup_finish_nif/1,
+    sqlite_dirty_close_nif/0]).
 
 -define(nif_stub, nif_stub_error(?LINE)).
 nif_stub_error(Line) ->
@@ -151,6 +158,14 @@ nif_stub_error(Line) ->
 -type parameter() :: integer() | float() | binary() | string() | iolist() | {binary, binary()} | undefined.
 %% Erlang type allowed to be used in SQLite bindings.
 
+-type parameters() :: [parameter()] | #{atom() | iolist() | pos_integer() => parameter()}.
+%% Positional and named parameters.
+%%
+%% A list of parameters must match the expected number of parameters.
+%% A map of parameters may be used to define named parameters, or
+%% assign specific columns. When map key is an integer, it is treated
+%% as a column index.
+
 -type row() :: tuple().
 
 -type prepare_options() :: #{
@@ -161,9 +176,9 @@ nif_stub_error(Line) ->
 %%
 %% <ul>
 %%   <li>`persistent': The SQLITE_PREPARE_PERSISTENT flag is a hint to the query planner that
-%%      the prepared statement will be retained for a long time and probably reused many times.</li>
+%%      the prepared statement will be retained for a long time and probably reused many times</li>
 %%   <li>`no_vtab': The SQLITE_PREPARE_NO_VTAB flag causes the SQL compiler to return an error
-%%      (error code SQLITE_ERROR) if the statement uses any virtual tables. </li>
+%%      (error code SQLITE_ERROR) if the statement uses any virtual tables</li>
 %% </ul>
 
 -type statement_info() :: #{
@@ -193,6 +208,27 @@ nif_stub_error(Line) ->
 %% See `sqlite3_status' in the SQLite reference for more details about
 %% exported statistics.
 
+-type progress_callback() :: fun((Remaining :: non_neg_integer(), Total :: non_neg_integer()) ->
+    ok | {ok, NewStep :: pos_integer()} | stop).
+%% Backup progress callback.
+%% Must return `ok' for backup to continue, `{ok, Steps}` to change the steps amount.
+%% Return `stop' to stop the backup process. Throwing an exception also stops the process.
+
+-type backup_options() :: #{
+    from => unicode:chardata(),
+    to => unicode:chardata(),
+    step => pos_integer(),
+    progress => progress_callback()
+}.
+%% Backup options
+%%
+%% <ul>
+%%   <li>`from': source database name, `main' is the default</li>
+%%   <li>`to': destination database name, takes `from' value as the default</li>
+%%   <li>`stop': backup step, pages. Default is 64</li>
+%%   <li>`progress': progress callback to invoke after finishing the next step</li>
+%% </ul>
+
 %% @equiv open(FileName, #{})
 -spec open(file:filename_all()) -> connection().
 open(FileName) ->
@@ -208,10 +244,16 @@ open(FileName, Options) ->
             Connection
     end.
 
-%% @doc Close the connection.
+%% @doc Closes the connection.
 %%
-%% Ensures that all prepared statements are deallocated. Releases
-%% underlying database file.
+%% Ensures that all prepared statements are deallocated. Forcibly
+%% stops all running backups (both source and destination). Releases
+%% the underlying database file.
+%%
+%% It is not necessary to call this function explicitly, as eventually
+%% all resources will be collected. However it might be useful if you
+%% need to unlock the database file immediately.
+%%
 %% Throws `badarg' if the connection is already closed.
 -spec close(connection()) -> ok.
 close(Connection) ->
@@ -223,8 +265,6 @@ close(Connection) ->
     end.
 
 %% @doc Returns connection statistics.
-%%
-%% Throws `badarg' if the connection is closed.
 -spec status(connection()) -> connection_status().
 status(Connection) ->
     case sqlite_status_nif(Connection) of
@@ -242,7 +282,15 @@ query(Connection, Query) ->
 %% @doc Runs an SQL query using specified connection
 %%
 %% Query may contain placeholders, e.g. `?', `?1', `?2'. Number of placeholders
-%% must match the length of the parameters list.
+%% must match the length of the parameters list. However for a map-based
+%% parameters, there is no such limitation, and it is supported to bind a single
+%% column using the following syntax: `#{2 => "value"}'.
+%%
+%% Named parameters are also supported:
+%% ```
+%% sqlite:query(Conn, "SELECT * FROM table WHERE key = :key", #{key => 1}).
+%% '''
+%% Missing named parameters are treated as NULL.
 %%
 %% Parameters are converted to sqlite storage classed using following type mappings:
 %% <ul>
@@ -262,9 +310,7 @@ query(Connection, Query) ->
 %%
 %% BLOB is always returned as a binary. Note that wrapping in `{binary, Bin}' tuple is
 %% only necessary for parameters, to tell the actual binary from an UTF8 encoded string.
-%%
-%% Throws `badarg' if connection is closed.
--spec query(connection(), iodata(), [parameter()]) -> [row()].
+-spec query(connection(), iodata(), parameters()) -> [row()].
 query(Connection, Query, Parameter) ->
     case sqlite_query_nif(Connection, Query, Parameter) of
         {error, Reason, ExtErr} ->
@@ -290,8 +336,6 @@ prepare(Connection, Query) ->
 %%
 %% Running a single {@link query/3} once is more efficient than preparing
 %% a statement, executing it once and discarding.
-%%
-%% Throws `badarg' if the connection is closed.
 -spec prepare(connection(), iodata(), prepare_options()) -> prepared_statement().
 prepare(Connection, Query, Options) ->
     case sqlite_prepare_nif(Connection, Query, Options) of
@@ -303,9 +347,11 @@ prepare(Connection, Query, Options) ->
 
 %% @doc Binds arguments to a prepared statement.
 %%
-%% Resets the prepared statement and binds new parameters.
+%% Does not reset the statement, and throws `badarg' with SQL_MISUSE
+%% explanation if the statement needs to be reset first.
+%%
 %% See {@link query/3} for types and bindings details.
--spec bind(prepared_statement(), [parameter()]) -> ok.
+-spec bind(prepared_statement(), parameters()) -> ok.
 bind(Prepared, Parameters) ->
     case sqlite_bind_nif(Prepared, Parameters) of
         {error, Reason, ExtErr} ->
@@ -345,9 +391,41 @@ step(Prepared, Steps) when Steps > 1 ->
             lists:reverse(List)
     end.
 
-%% @doc Returns column names and types for the prepared statement.
+%% @doc Resets the prepared statement, but does not clear bindings
+-spec reset(prepared_statement()) -> ok.
+reset(Prepared) ->
+    case sqlite_reset_nif(Prepared) of
+        {error, Reason, ExtErr} ->
+            erlang:error(Reason, [Prepared], [{error_info, #{cause => ExtErr}}]);
+        Result ->
+            Result
+    end.
+
+%% @doc Clears bindings of the prepared statement
+-spec clear(prepared_statement()) -> ok.
+clear(Prepared) ->
+    case sqlite_clear_nif(Prepared) of
+        {error, Reason, ExtErr} ->
+            erlang:error(Reason, [Prepared], [{error_info, #{cause => ExtErr}}]);
+        Result ->
+            Result
+    end.
+
+%% @doc Finalises the prepared statement, freeing any resources allocated
 %%
-%% Throws `badarg' if the connection is closed.
+%% The purpose of this function is to cancel statements that are executed
+%% halfway through, and it is desirable to stop execution and free all
+%% allocated resources.
+-spec finish(prepared_statement()) -> ok.
+finish(Prepared) ->
+    case sqlite_finish_nif(Prepared) of
+        {error, Reason, ExtErr} ->
+            erlang:error(Reason, [Prepared], [{error_info, #{cause => ExtErr}}]);
+        Result ->
+            Result
+    end.
+
+%% @doc Returns column names and types for the prepared statement.
 -spec describe(prepared_statement()) -> [{column_name(), column_type()}].
 describe(Prepared) ->
     case sqlite_describe_nif(Prepared) of
@@ -358,8 +436,6 @@ describe(Prepared) ->
     end.
 
 %% @doc Returns runtime statistics for the prepared statement.
-%%
-%% Throws `badarg' if the connection is closed.
 -spec info(prepared_statement()) -> statement_info().
 info(Prepared) ->
     case sqlite_info_nif(Prepared) of
@@ -369,7 +445,7 @@ info(Prepared) ->
             Description
     end.
 
-%% @doc Runs the prepared statement with parameters bound.
+%% @doc Runs the prepared statement with new parameters bound.
 %%
 %% Resets the prepared statement, binds new parameters and
 %% steps until no more rows are available. Throws an error
@@ -377,8 +453,7 @@ info(Prepared) ->
 %% for busy timeout handling.
 %%
 %% See {@link query/3} for types and bindings details.
-%% Throws `badarg' if the connection is closed.
--spec execute(prepared_statement(), [parameter()]) -> [row()].
+-spec execute(prepared_statement(), parameters()) -> [row()].
 execute(Prepared, Parameters) ->
     case sqlite_execute_nif(Prepared, Parameters) of
         {error, Reason, ExtErr} ->
@@ -430,9 +505,7 @@ demonitor(Ref) ->
 %% @doc Interrupts the query running on this connection.
 %%
 %% WARNING: this function is unsafe to use concurrently with
-%% closing the connection.
-%%
-%% Throws `badarg' if the connection is closed.
+%% `close/1' on the same connection.
 -spec interrupt(connection()) -> ok.
 interrupt(Connection) ->
     sqlite_interrupt_nif(Connection).
@@ -449,6 +522,53 @@ system_info() ->
 -spec get_last_insert_rowid(connection()) -> integer().
 get_last_insert_rowid(Connection) ->
     sqlite_get_last_insert_rowid_nif(Connection).
+
+%% @doc Backs up the main database of the source to the destination.
+backup(Source, Destination) ->
+    backup(Source, Destination, #{from => <<"main">>, to => <<"main">>}).
+
+%% @doc Runs a backup with the options specified
+%%
+%% Returns `ok' if the backup was successful, or `stop'
+%% if the process was requested to stop.
+-spec backup(Source :: connection(), Destination :: connection(), Options :: backup_options()) -> ok | stop.
+backup(Source, Destination, Options) ->
+    SrcDb = maps:get(from, Options, <<"main">>),
+    DstDb = maps:get(to, Options, SrcDb),
+    Step = maps:get(step, Options, 64),
+    case sqlite_backup_init_nif(Source, SrcDb, Destination, DstDb) of
+        {error, Reason, ExtErr} ->
+            erlang:error(Reason, [Source, Destination, Options], [{error_info, #{cause => ExtErr}}]);
+        Ref ->
+            try
+                do_backup(Ref, Step, maps:get(progress, Options, undefined))
+            after
+                sqlite_backup_finish_nif(Ref)
+            end
+    end.
+
+%%-------------------------------------------------------------------
+%% Internal implementation
+
+do_backup(Ref, Step, Progress) ->
+    case sqlite_backup_step_nif(Ref, Step) of
+        {_Remaining, _Total} when Progress =:= undefined ->
+            do_backup(Ref, Step, Progress);
+        {Remaining, Total} ->
+            case Progress(Remaining, Total) of
+                ok ->
+                    do_backup(Ref, Step, Progress);
+                {ok, NewStep} ->
+                    do_backup(Ref, NewStep, Progress);
+                stop ->
+                    stop
+            end;
+        ok ->
+            ok;
+        {error, Reason, ExtErr} ->
+            io:format(user, "ERR: ~p, ~p ~n", [Reason, ExtErr]),
+            erlang:error(Reason, [Ref, Step], [{error_info, #{cause => ExtErr}}])
+    end.
 
 %% @doc Formats exception according to EEP-54.
 %%
@@ -485,6 +605,15 @@ sqlite_bind_nif(_Prepared, _Parameters) ->
 sqlite_step_nif(_Prepared, _Steps) ->
     ?nif_stub.
 
+sqlite_reset_nif(_Prepared) ->
+    ?nif_stub.
+
+sqlite_clear_nif(_Prepared) ->
+    ?nif_stub.
+
+sqlite_finish_nif(_Prepared) ->
+    ?nif_stub.
+
 sqlite_info_nif(_Prepared) ->
     ?nif_stub.
 
@@ -504,6 +633,15 @@ sqlite_system_info_nif() ->
     ?nif_stub.
 
 sqlite_get_last_insert_rowid_nif(_Connection) ->
+    ?nif_stub.
+
+sqlite_backup_init_nif(_Src, _SrcDb, _Dst, _DstDb) ->
+    ?nif_stub.
+
+sqlite_backup_step_nif(_Backup, _Pages) ->
+    ?nif_stub.
+
+sqlite_backup_finish_nif(_Backup) ->
     ?nif_stub.
 
 sqlite_dirty_close_nif() ->
