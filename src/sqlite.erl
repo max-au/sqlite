@@ -566,7 +566,6 @@ do_backup(Ref, Step, Progress) ->
         ok ->
             ok;
         {error, Reason, ExtErr} ->
-            io:format(user, "ERR: ~p, ~p ~n", [Reason, ExtErr]),
             erlang:error(Reason, [Ref, Step], [{error_info, #{cause => ExtErr}}])
     end.
 

@@ -17,7 +17,7 @@
     race_close_prepare/0, race_close_prepare/1,
     enif_alloc/0, enif_alloc/1,
     malloc/0, malloc/1,
-    backup/1,
+    backup/1, backup_sanity/0, backup_sanity/1,
     named_parameters/0, named_parameters/1,
     prepared/1, errors/1, monitor/1,
     concurrency/0, concurrency/1,
@@ -46,7 +46,7 @@ end_per_testcase(_TC, Config) ->
 all() ->
     [basic, bind_step, shared, shared_cache, interrupt, crash, types, close, status,
         enif_alloc, prepared, errors, monitor, concurrency, race_close_prepare,
-        delayed_dealloc_kill, malloc, backup].
+        delayed_dealloc_kill, malloc, backup, backup_sanity].
 
 %%-------------------------------------------------------------------
 %% Convenience functions
@@ -60,6 +60,41 @@ ensure_unload(Mod) ->
         end,
     ?assertNot(erlang:module_loaded(Mod)).
 
+create_blob_db(BlobCount) ->
+    Src = sqlite:open("", #{flags => [memory]}),
+    sqlite:query(Src, "CREATE TABLE large (blob BLOB)"),
+    [] = sqlite:query(Src, "BEGIN;"),
+    [[] = sqlite:query(Src, "INSERT INTO large VALUES(randomblob(4072));") || _ <- lists:seq(1, BlobCount)],
+    [] = sqlite:query(Src, "COMMIT;"),
+    Src.
+
+start_backup() ->
+    Src = create_blob_db(8),
+    Dst = sqlite:open("", #{flags => [memory]}),
+    %% start the backup in a separate process, to keep this one for tests
+    Control = self(),
+    Backup = spawn_link(
+        fun () ->
+            try
+                Return = sqlite:backup(Src, Dst, #{step => 1, progress =>
+                    fun (_Remain, _Total) ->
+                        Control ! in_backup,
+                        receive {continue, Ret} -> Ret end
+                    end}),
+                Control ! {return, Return}
+            catch
+                Class:Reason:Stack ->
+                    Control ! {exception, Class, Reason, Stack}
+            end
+        end),
+    receive in_backup -> ok end,
+    {Src, Dst, Backup}.
+
+continue_backup(Backup) ->
+    Backup ! {continue, ok},
+    receive Result -> Result end.
+
+%% extra assertion macro that verifies extended error information
 -define(assertExtended(Class, Term, ErrorInfo, Expr),
     begin
         ((fun () ->
@@ -418,29 +453,43 @@ alloc_some() ->
     {Conn, Preps}.
 
 backup(Config) when is_list(Config) ->
-    Src = sqlite:open("", #{flags => [memory]}),
-    Dst = sqlite:open("", #{flags => [memory]}),
-    sqlite:query(Src, "CREATE TABLE large (blob BLOB)"),
-    [] = sqlite:query(Src, "BEGIN;"),
-    [[] = sqlite:query(Src, "INSERT INTO large VALUES(randomblob(4072));") || _ <- lists:seq(1, 8)], %% 8 pages total
-    [] = sqlite:query(Src, "COMMIT;"),
+    Src = create_blob_db(8),
     %% do the basic backup
+    Dst = sqlite:open("", #{flags => [memory]}),
     ok = sqlite:backup(Src, Dst),
-    ?assertEqual([{8}], [sqlite:query(Dst, "SELECT COUNT(*) FROM large")]),
-    %% do the fancier backup, with progress tracking, step setting etc.
+    ?assertEqual([{8}], sqlite:query(Dst, "SELECT COUNT(*) FROM large")),
+    %% do the fancier backup, with progress tracking, step setting and exception
+    %% aborting the backup
     Dst2 = sqlite:open("", #{flags => [memory]}),
     try sqlite:backup(Src, Dst2, #{from => "main", step => 2, progress =>
-        fun (Prg, _Total) when Prg < 3 -> ok;
-            (Prg, _Total) when Prg < 5 -> {ok, 1};
-            (Prg, Total) -> throw({expected, Prg, Total})
+        fun (Rem, _Total) when Rem > 6 -> ok;
+            (Rem, _Total) when Rem > 4 -> {ok, 1};
+            (Rem, Total) -> throw({expected, Rem, Total})
         end})
     catch
-        throw:{expected, Progress, Total} ->
-            ?assertEqual(5, Progress),
-            ?assertEqual(8, Total)
-    end,
-    %% check backup interaction with close/1
-    ok.
+        throw:{expected, Remaining, Total} ->
+            ?assertEqual(4, Remaining),
+            ?assert(Total > 0 andalso Total > Remaining)
+    end.
+
+backup_sanity() ->
+    [{doc, ""}].
+
+backup_sanity(Config) when is_list(Config) ->
+    {Src0, Dst0, Backup0} = start_backup(),
+    sqlite:close(Src0), %% must force-close the backup (causing backup to abort)
+    {exception, error, badarg, [{sqlite, _, _, Ext} | _]} = continue_backup(Backup0),
+    ?assertEqual(#{1 => <<"backup aborted (connection closed)">>},
+        maps:get(cause, proplists:get_value(error_info, Ext))),
+    sqlite:close(Dst0),
+    {Src1, Dst1, Backup1} = start_backup(),
+    %% ensure that destination is locked when backup is in progress
+    ?assertExtended(error, badarg, #{cause => #{1 => <<"connection busy (backup destination)">>}},
+        sqlite:query(Dst1, "SELECT * from large")),
+    %% check backup destination interaction with close/1
+    sqlite:close(Dst1),
+    sqlite:close(Src1),
+    {exception, error, badarg, [{sqlite, _, _, Ext} | _]} = continue_backup(Backup1).
 
 errors(Config) when is_list(Config) ->
     %% test EPP-54 extended error information
