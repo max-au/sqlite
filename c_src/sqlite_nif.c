@@ -264,6 +264,7 @@ static void sqlite_backup_destroy(ErlNifEnv *env, void *arg) {
     /* remove the reference from the destination */
     enif_release_resource(backup_res->reference->source);
     enif_release_resource(backup_res->reference->destination);
+    enif_free(backup_res->reference);
 }
 
 /* -------------------------------------------------------------------------------- */
@@ -1430,9 +1431,7 @@ static ERL_NIF_TERM sqlite_backup_finish_nif(ErlNifEnv *env, int argc, const ERL
     enif_mutex_unlock(dst->mutex);
 
     backup_res->reference->backup = NULL;
-    enif_free(backup_res->reference);
-    backup_res->reference = NULL;
-
+    
     return am_ok;
 }
 
