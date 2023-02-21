@@ -1,4 +1,7 @@
 # sqlite
+
+[![Build Status](https://github.com/max-au/sqlite/actions/workflows/erlang.yml/badge.svg?branch=master)](https://github.com/max-au/sqlite/actions) [![Hex.pm](https://img.shields.io/hexpm/v/sqlite.svg)](https://hex.pm/packages/sqlite) [![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/sqlite)
+
 sqlite3 NIF bindings for Erlang.
 
 See `sqlite:query/3` for the data type conversion details. Current version
