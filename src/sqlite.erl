@@ -40,7 +40,7 @@
     sqlite_step_nif/2, sqlite_monitor_nif/2, sqlite_describe_nif/1, sqlite_interrupt_nif/1,
     sqlite_system_info_nif/0, sqlite_get_last_insert_rowid_nif/1, sqlite_finish_nif/1,
     sqlite_backup_init_nif/4, sqlite_backup_step_nif/2, sqlite_backup_finish_nif/1,
-    sqlite_dirty_close_nif/0]).
+    sqlite_dirty_close_nif/0, sqlite_dirty_backup_finish_nif/0]).
 
 -define(nif_stub, nif_stub_error(?LINE)).
 nif_stub_error(Line) ->
@@ -646,6 +646,9 @@ sqlite_backup_finish_nif(_Backup) ->
 sqlite_dirty_close_nif() ->
     ?nif_stub.
 
+sqlite_dirty_backup_finish_nif() ->
+    ?nif_stub.
+
 %%-------------------------------------------------------------------
 %% Internal implementation
 
@@ -665,6 +668,9 @@ delayed_dealloc() ->
     receive
         undefined ->
             sqlite_dirty_close_nif(),
+            delayed_dealloc();
+        general ->
+            sqlite_dirty_backup_finish_nif(),
             delayed_dealloc()
     end.
 

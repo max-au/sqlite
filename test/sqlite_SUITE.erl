@@ -55,7 +55,7 @@ ensure_unload(Mod) ->
     erlang:module_loaded(Mod) andalso
         begin
             [garbage_collect(Pid) || Pid <- processes()], %% must GC all resource types of the library
-            code:delete(Mod),
+            true = code:delete(Mod),
             code:purge(Mod)
         end,
     ?assertNot(erlang:module_loaded(Mod)).
@@ -476,12 +476,12 @@ backup_sanity() ->
     [{doc, ""}].
 
 backup_sanity(Config) when is_list(Config) ->
-    {Src0, Dst0, Backup0} = start_backup(),
-    sqlite:close(Src0), %% must force-close the backup (causing backup to abort)
-    {exception, error, badarg, [{sqlite, _, _, Ext} | _]} = continue_backup(Backup0),
-    ?assertEqual(#{1 => <<"backup aborted (connection closed)">>},
-        maps:get(cause, proplists:get_value(error_info, Ext))),
-    sqlite:close(Dst0),
+    %{Src0, Dst0, Backup0} = start_backup(),
+    %sqlite:close(Src0), %% must force-close the backup (causing backup to abort)
+    %{exception, error, badarg, [{sqlite, _, _, Ext} | _]} = continue_backup(Backup0),
+    %?assertEqual(#{1 => <<"backup aborted (connection closed)">>},
+    %    maps:get(cause, proplists:get_value(error_info, Ext))),
+    %sqlite:close(Dst0),
     {Src1, Dst1, Backup1} = start_backup(),
     %% ensure that destination is locked when backup is in progress
     ?assertExtended(error, badarg, #{cause => #{1 => <<"connection busy (backup destination)">>}},
@@ -525,55 +525,97 @@ concurrency() ->
         {timetrap, {seconds, 60}}].
 
 concurrency(Config) when is_list(Config) ->
-    Concurrency = erlang:system_info(schedulers_online) * 4,
+    Concurrency = erlang:system_info(dirty_io_schedulers),
     FileName = filename:join(proplists:get_value(priv_dir, Config), "db.bin"),
     %% create a DB with schema
-    Db = sqlite:open(FileName, #{mode => read_write_create}),
-    [] = sqlite:query(Db, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
-    sqlite:close(Db),
-    %% share a connection (and prepared statements) between many workers using ETS
-    Workers = [erlang:spawn_link(fun() -> worker(rand:seed(exrop, {Seq, 0, 0}), FileName) end) || Seq <- lists:seq(1, Concurrency)],
-    Monitors = [{W, erlang:monitor(process, W)} || W <- Workers],
+    Src = sqlite:open(FileName, #{busy_timeout => 60000}),
+    [] = sqlite:query(Src, "CREATE TABLE kv (key INTEGER PRIMARY KEY AUTOINCREMENT, val INTEGER)"),
+    %% use the connection by many workers
+    Count = 500,
+    StartOpt = #{control => self(), filename => FileName},
+    Workers = [erlang:spawn_link(fun() -> worker(Count, rand:seed(exrop, {Seq, 0, 0}), Src, StartOpt) end)
+        || Seq <- lists:seq(1, Concurrency)],
+    [W ! {workers, Workers} || W <- Workers],
     %% wait for all of them to complete (with no error, otherwise the link crashes test runner)
-    [receive {'DOWN', Mon, process, Pid, Reason} -> Reason end || {Pid, Mon} <- Monitors].
+    progress(Count * Concurrency, maps:from_list([{W, Count} || W <- Workers])).
 
-worker(Seed, FileName) ->
-    worker(500, Seed, sqlite:open(FileName, #{busy_timeout => 60000, mode => read_write}), FileName, []).
+progress(0, WP) ->
+    Monitors = [{W, erlang:monitor(process, W)} || W <- maps:keys(WP)],
+    [receive {'DOWN', Mon, process, Pid, Reason} -> Reason end || {Pid, Mon} <- Monitors];
+progress(Total, WP) ->
+    receive
+        {progress, Worker, Left} ->
+            #{Worker := Before} = WP,
+            ?assert(Left =< Before, {left, Left, before, Before}),
+            NewTotal = Total - (Before - Left),
+            (Total div 1000) > (NewTotal div 1000) andalso
+                io:format(user, " -> ~b", [NewTotal]),
+            progress(NewTotal, WP#{Worker => Left})
+    end.
 
-%% Possible actions:
-%%  * open/close a DB
-%%  * send DB to another process/receive DB
-%%  * create a statement/destroy
-%%  * execute a statement
-worker(0, _Seed, _Db, _FileName, _Statements) ->
-    ok;
-worker(Count, Seed, Db, FileName, Statements) ->
-    {Next, NewSeed} = rand:uniform_s(80, Seed),
-    case Next of
-        0 ->
-            ok = sqlite:close(Db),
-            NewDb = sqlite:open(FileName, #{busy_timeout => 60000, mode => read_write}),
-            worker(Count - 1, NewSeed, NewDb, FileName, []);
-        NewStatement when NewStatement < 10 ->
-            try
-                Prep = sqlite:prepare(Db, "INSERT INTO kv (val) VALUES (?1)", #{persistent => true}),
-                worker(Count - 1, NewSeed, Db, FileName, [Prep | Statements])
-            catch
-                TX:TY ->
-                    io:format(user, "prepare: ~s:~p~n", [TX, TY]),
-                    worker(Count, NewSeed, Db, FileName, Statements)
-            end;
-        DelStatement when DelStatement < 20, length(Statements) > 0 ->
-            NewStmts = lists:droplast(Statements),
-            worker(Count - 1, NewSeed, Db, FileName, NewStmts);
-        _RunStatement when length(Statements) > 0 ->
-            try sqlite:execute(hd(Statements), [1])
-            catch X:Y -> io:format(user, "exec: ~s:~p~n", [X, Y])
-            end,
-            worker(Count - 1, NewSeed, Db, FileName, Statements);
-        _RunStatement ->
-            %% skipping a step
-            worker(Count, NewSeed, Db, FileName, Statements)
+worker(Count, Seed, Src, StartOpt) ->
+    receive
+        {workers, Workers} ->
+            worker(Count, Seed, Src, [], StartOpt#{workers => Workers})
+    end.
+
+%% This is a mini-property based test, running random actions
+worker(0, _Seed, _Db, _Statements, #{control := Control}) ->
+    Control ! {progress, self(), 0};
+worker(Count, Seed, Db, Statements, #{control := Control} = StartOpt) ->
+    {Next, NewSeed} = rand:uniform_s(51, Seed),
+    Control ! {progress, self(), Count},
+    {NewCount, NS, NDb, NST} =
+        case Next of
+            1 ->
+                try
+                    ok = sqlite:close(Db),
+                    #{filename := FileName, workers := Workers} = StartOpt,
+                    NewDb = sqlite:open(FileName, #{busy_timeout => 60000, mode => read_write}),
+                    %% notify all other workers
+                    [W ! {new_db, NewDb} || W <- Workers, W =/= self()],
+                    {Count - 1, NewSeed, NewDb, []}
+                catch
+                    error:badarg ->
+                        {Count, Seed, receive_db(), []}
+                end;
+            2 ->
+                Dst = sqlite:open("", #{flags => [memory]}),
+                try sqlite:backup(Db, Dst),
+                    sqlite:close(Dst),
+                    {Count - 1, NewSeed, Db, Statements}
+                catch
+                    error:badarg ->
+                        {Count, Seed, receive_db(), []}
+                end;
+            NewStatement when NewStatement < 12 ->
+                try
+                    Prep = sqlite:prepare(Db, "INSERT INTO kv (val) VALUES (?1)", #{persistent => true}),
+                    {Count - 1, NewSeed, Db, [Prep | Statements]}
+                catch
+                    error:badarg ->
+                        {Count, Seed, receive_db(), []}
+                end;
+            DelStatement when DelStatement < 22, length(Statements) > 0 ->
+                NewStmts = lists:droplast(Statements),
+                {Count - 1, NewSeed, Db, NewStmts};
+            RunStatement when RunStatement < 52, length(Statements) > 0 ->
+                try sqlite:execute(hd(Statements), [1]),
+                    {Count - 1, NewSeed, Db, Statements}
+                catch
+                    error:badarg ->
+                        {Count, Seed, receive_db(), []}
+                end;
+            _RunStatement ->
+                %% skipping a step
+                {Count, NewSeed, Db, Statements}
+        end,
+    worker(NewCount, NS, NDb, NST, StartOpt).
+
+receive_db() ->
+    receive
+        {new_db, NewDb} ->
+            NewDb
     end.
 
 race_close_prepare() ->

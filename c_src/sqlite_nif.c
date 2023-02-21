@@ -99,7 +99,6 @@ static ERL_NIF_TERM am_version;
 /* forward definitions (linked list) */
 typedef struct connection_t connection_t;
 typedef struct statement_t statement_t;
-typedef struct backup_t backup_t;
 typedef struct delayed_close_t delayed_close_t;
 
 /* prepared statement: stored as a part of the connection */
@@ -109,24 +108,29 @@ struct statement_t {
     statement_t* released;      /* next released statement that can be reused */
 };
 
-/* backup: part of both connections */
-struct backup_t {
+/* This structure has pointers from the backup resource, source and
+destination connections. In order to change any member of the structure,
+both source and destination mutexes must be help. The order is important:
+to avoid a deadlock, source must be taken first.
+*/
+typedef struct {
     sqlite3_backup* backup;
     connection_t* source;
     connection_t* destination;
-    backup_t* next;             /* do not anticipate many backups running */
-};
+} backup_t;
 
 struct connection_t {
     ErlNifMutex* mutex;         /* used to protect the entire structure from concurrent access */
     sqlite3* connection;        /* sqlite3 handle */
     ErlNifPid tracer;           /* process to send ROWID updates */
     ERL_NIF_TERM ref;           /* sent to the tracer process */
-    ErlNifMutex* stmt_mutex;    /* mutex protecting the statements list */
+
+    backup_t* source;           /* references backup from the source */
+    backup_t* destination;      /* references backup object from the destination, prohibiting all access*/
+
+    ErlNifMutex* stmt_mutex;    /* mutex protecting statement lists */
     statement_t* statements;    /* list of all statements for this connection */
     statement_t* released;      /* head of the 'released statements sublist' */
-    backup_t* recipient;        /* non-NULL when the database is locked as a backup destination */
-    backup_t* backups;          /* attached backups */
 };
 
 /* resources: connection and connection-to-deallocate */
@@ -137,13 +141,14 @@ static ErlNifPid s_delayed_close_pid;
 struct delayed_close_t {
     sqlite3* connection;
     statement_t* statements;    /* list of all statements for this connection */
-    backup_t* backups;
+    backup_t* source;
+    backup_t* destination;
     delayed_close_t* next;
 };
 
 /* queue of connections to delete */
 static delayed_close_t* s_delayed_close_queue;
-/* mutex protexting the queue (could be done lockless, but there is no sense in it) */
+/* mutex protecting the queue (could be done lockless, but there is no sense in it) */
 static ErlNifMutex* s_delayed_close_mutex;
 
 /* forward declaration, to emergency use in the destructor */
@@ -170,7 +175,8 @@ static void sqlite_connection_destroy(ErlNifEnv *env, void *arg) {
         delayed_close_t* node = enif_alloc(sizeof(delayed_close_t));
         node->connection = conn->connection;
         node->statements = conn->statements;
-        node->backups = conn->backups;
+        node->source = conn->source;
+        node->destination = conn->destination;
         enif_mutex_lock(s_delayed_close_mutex);
         node->next = s_delayed_close_queue;
         s_delayed_close_queue = node;
@@ -194,15 +200,9 @@ static void sqlite_connection_destroy(ErlNifEnv *env, void *arg) {
             enif_free(freed);
         }
 
-        /* all backups are done too */
-        backup_t* bckp = conn->backups;
-        backup_t* bckp_freed;
-        while (bckp) {
-            ASSERT(bckp->backup == NULL);
-            bckp_freed = bckp;
-            bckp = bckp->next;
-            enif_free(bckp_freed);
-        }
+        /* backup has also been released */
+        ASSERT(conn->source == NULL);
+        ASSERT(conn->destination == NULL);
     }
 
     enif_mutex_destroy(conn->stmt_mutex);
@@ -249,22 +249,50 @@ static void sqlite_statement_destroy(ErlNifEnv *env, void *arg) {
 
 /* Backup resource. Jumps through similar hoops as the prepared statement to
   avoid blocking in the GC callback, but now with 2 connections.
-  Closing either of the connections needs to have access to another connection
-  (including the lock).
   */
 static ErlNifResourceType *s_backup_resource;
 
+typedef struct backup_finish_t backup_finish_t;
+
+struct backup_finish_t {
+    backup_t* unfinished;
+    backup_finish_t* next;
+};
+
+/* queue of backups to finish */
+static backup_finish_t* s_backup_finish_queue;
+/* mutex protecting delayed backup finish queue */
+static ErlNifMutex* s_backup_finish_mutex;
+
 typedef struct {
-    backup_t* reference;        /* both src&dest have the pointer in the list */
+    backup_t* reference;
 } backup_resource_t;
+
+/* forward declaration for the dirty NIF */
+static ERL_NIF_TERM sqlite_dirty_backup_finish_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 /* must not take connection mutex */
 static void sqlite_backup_destroy(ErlNifEnv *env, void *arg) {
     backup_resource_t *backup_res = (backup_resource_t*)arg;
-    /* remove the reference from the destination */
-    enif_release_resource(backup_res->reference->source);
-    enif_release_resource(backup_res->reference->destination);
-    enif_free(backup_res->reference);
+    if (backup_res->reference->backup) {
+        backup_finish_t* fini = (backup_finish_t*)enif_alloc(sizeof(backup_finish_t));
+        /* backup process crashed without calling finish */
+        enif_mutex_lock(s_backup_finish_mutex);
+        fini->unfinished = backup_res->reference;
+        fini->next = s_backup_finish_queue;
+        s_backup_finish_queue = fini;
+        enif_mutex_unlock(s_backup_finish_mutex);
+        /* notify garbage collection process */
+        if (!enif_send(env, &s_delayed_close_pid, NULL, am_general)) {
+            enif_fprintf(stderr, "backup resource deallocating in a normal scheduler");
+            /* last resort, cleanup resources locally */
+            sqlite_dirty_backup_finish_nif(env, 0, NULL);
+        }
+    } else {
+        enif_release_resource(backup_res->reference->source);
+        enif_release_resource(backup_res->reference->destination);
+        enif_free(backup_res->reference);
+    }
 }
 
 /* -------------------------------------------------------------------------------- */
@@ -422,8 +450,8 @@ static ERL_NIF_TERM sqlite_open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     conn->connection = sqlite;
     conn->statements = NULL;
     conn->released = NULL;
-    conn->backups = NULL;
-    conn->recipient = NULL;
+    conn->source = NULL;
+    conn->destination = NULL;
     conn->mutex = enif_mutex_create("sqlite3_connection");
     ASSERT(conn->mutex);
     conn->stmt_mutex = enif_mutex_create("sqlite3_statement");
@@ -440,7 +468,6 @@ static ERL_NIF_TERM sqlite_close_nif(ErlNifEnv *env, int argc, const ERL_NIF_TER
     connection_t *conn;
     sqlite3* sqlite_db;
     statement_t* open;
-    backup_t* backups;
 
     if (!enif_get_resource(env, argv[0], s_connection_resource, (void **) &conn))
         return make_badarg(env, NULL, 1, "not a connection reference");
@@ -463,22 +490,41 @@ static ERL_NIF_TERM sqlite_close_nif(ErlNifEnv *env, int argc, const ERL_NIF_TER
         open = open->next;
     }
 
-    /* DO NOT take the backup_mutex of any connection, or it will block GC */
-    /* iterate over all backups, finalising sqlite3_backup* */
-    backups = conn->backups;
-    while (backups) {
-        /* backup belongs to two connections, so there is a need in locking the
-        recipient too. Now the question is, HOW to do that? TRYLOCK? FIXME: recipient close */
-        if (backups->backup)
-            sqlite3_backup_finish(backups->backup);
-        backups->backup = NULL;
-        backups = backups->next;
+    /* source connection can always take the destination mutex */
+    if (conn->source) {
+        enif_mutex_lock(conn->source->destination->mutex);
+        conn->source->destination->destination = NULL;
+        sqlite3_backup_finish(conn->source->backup);
+        conn->source->backup = NULL;
+        enif_mutex_unlock(conn->source->destination->mutex);
+        conn->source = NULL;
     }
 
-    if (conn->recipient) {
-        if (conn->recipient->backup)
-            sqlite3_backup_finish(conn->recipient->backup);
-        conn->recipient->backup = NULL;
+    /* destination connection can try, but not necessarily succeed */
+    if (conn->destination) {
+        if (enif_mutex_trylock(conn->destination->source->mutex) == 0) {
+            conn->destination->source->source = NULL;
+            sqlite3_backup_finish(conn->destination->backup);
+            conn->destination->backup = NULL;
+            enif_mutex_unlock(conn->destination->source->mutex);
+            conn->destination = NULL;
+        } else {
+            /* potential deadlock: must take the mutexes starting
+            from the backup source */
+            connection_t* backup_src = conn->destination->source;
+            enif_mutex_unlock(conn->mutex);
+            enif_mutex_lock(backup_src->mutex);
+            enif_mutex_lock(conn->mutex);
+            /* here backup object may already be cleaned up, so need to double-check */
+            if (backup_src->source) {
+                sqlite3_backup_finish(conn->destination->backup);
+                conn->destination->backup = NULL;
+                backup_src->source = NULL;
+                conn->destination = NULL;
+            }
+            enif_mutex_unlock(conn->mutex);
+            enif_mutex_unlock(backup_src->mutex);
+        }
     }
 
     /* close the connection, there must not be any statements left */
@@ -514,16 +560,9 @@ static ERL_NIF_TERM sqlite_dirty_close_nif(ErlNifEnv *env, int argc, const ERL_N
         enif_free(freed);
     }
 
-    /* all backups are closed too */
-    backup_t* bckp = next->backups;
-    backup_t* bckp_freed;
-    while (bckp) {
-        if (bckp->backup)
-            sqlite3_backup_finish(bckp->backup);
-        bckp_freed = bckp;
-        bckp = bckp->next;
-        enif_free(bckp_freed);
-    }
+    /* no backup can reference this connection */
+    ASSERT(next->source == NULL);
+    ASSERT(next->destination == NULL);
 
     int ret = sqlite3_close(next->connection);
     ASSERT(ret == SQLITE_OK);
@@ -756,7 +795,7 @@ static ERL_NIF_TERM sqlite_prepare_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
         return make_badarg(env, NULL, 1, "connection closed");
     }
 
-    if (conn->recipient) {
+    if (conn->destination) {
         enif_mutex_unlock(conn->mutex);
         enif_release_resource(stmt_res);
         return make_badarg(env, NULL, 1, "connection busy (backup destination)");
@@ -825,7 +864,7 @@ static ERL_NIF_TERM sqlite_bind_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return make_badarg(env, NULL, 1, "connection closed");
     }
 
-    if (stmt->connection->recipient) {
+    if (stmt->connection->destination) {
         enif_mutex_unlock(stmt->connection->mutex);
         return make_badarg(env, NULL, 1, "connection busy (backup destination)");
     }
@@ -854,7 +893,7 @@ static ERL_NIF_TERM sqlite_step_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return make_badarg(env, NULL, 1, "connection closed");
     }
 
-    if (stmt->connection->recipient) {
+    if (stmt->connection->destination) {
         enif_mutex_unlock(stmt->connection->mutex);
         return make_badarg(env, NULL, 1, "connection busy (backup destination)");
     }
@@ -986,7 +1025,7 @@ static ERL_NIF_TERM sqlite_execute_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
         return make_badarg(env, NULL, 1, "connection closed");
     }
 
-    if (stmt->connection->recipient) {
+    if (stmt->connection->destination) {
         enif_mutex_unlock(stmt->connection->mutex);
         return make_badarg(env, NULL, 1, "connection busy (backup destination)");
     }
@@ -1081,7 +1120,7 @@ static ERL_NIF_TERM sqlite_query_nif(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return make_badarg(env, NULL, 1, "connection closed");
     }
 
-    if (conn->recipient) {
+    if (conn->destination) {
         enif_mutex_unlock(conn->mutex);
         return make_badarg(env, NULL, 1, "connection busy (backup destination)");
     }
@@ -1353,15 +1392,26 @@ static ERL_NIF_TERM sqlite_backup_init_nif(ErlNifEnv *env, int argc, const ERL_N
 
     /* now start taking locks */
     enif_mutex_lock(src->mutex);
-    if (enif_mutex_trylock(dst->mutex)) {
+    if (src->connection == NULL) {
         enif_mutex_unlock(src->mutex);
-        return make_badarg(env, NULL, 4, "failed to lock destination database");
+        return make_badarg(env, NULL, 1, "connection closed");
     }
 
-    if (dst->recipient) {
+    if (enif_mutex_trylock(dst->mutex)) {
+        enif_mutex_unlock(src->mutex);
+        return make_badarg(env, NULL, 3, "failed to lock destination database");
+    }
+
+    if (dst->connection == NULL) {
         enif_mutex_unlock(dst->mutex);
         enif_mutex_unlock(src->mutex);
-        return make_badarg(env, NULL, 4, "connection busy (backup destination)");
+        return make_badarg(env, NULL, 3, "connection closed");
+    }
+
+    if (dst->destination) {
+        enif_mutex_unlock(dst->mutex);
+        enif_mutex_unlock(src->mutex);
+        return make_badarg(env, NULL, 3, "connection busy (backup destination)");
     }
 
     sqlite3_backup* bckp = sqlite3_backup_init(dst->connection, dst_db, src->connection, src_db);
@@ -1380,17 +1430,18 @@ static ERL_NIF_TERM sqlite_backup_init_nif(ErlNifEnv *env, int argc, const ERL_N
         return enif_raise_exception(env, am_out_of_memory);
     }
 
-    enif_mutex_unlock(dst->mutex);
-    enif_mutex_unlock(src->mutex);
-
     backup_t* backup = (backup_t*)enif_alloc(sizeof(backup_t));
+    ASSERT(backup);
     backup_res->reference = backup;
     backup->backup = bckp;
     backup->source = src;
     backup->destination = dst;
-    backup->next = src->backups;
-    src->backups = backup;
-    dst->recipient = backup;
+
+    src->source = backup;
+    dst->destination = backup;
+
+    enif_mutex_unlock(dst->mutex);
+    enif_mutex_unlock(src->mutex);
 
     enif_keep_resource(src);
     enif_keep_resource(dst);
@@ -1406,31 +1457,19 @@ static ERL_NIF_TERM sqlite_backup_finish_nif(ErlNifEnv *env, int argc, const ERL
     if (!enif_get_resource(env, argv[0], s_backup_resource, (void **) &backup_res))
         return make_badarg(env, NULL, 1, "not a backup reference");
 
-    if (!backup_res->reference->backup)
-        return make_badarg(env, NULL, 1, "backup aborted (connection closed)");
-
     connection_t* src = backup_res->reference->source;
     connection_t* dst = backup_res->reference->destination;
 
     enif_mutex_lock(src->mutex);
-    sqlite3_backup_finish(backup_res->reference->backup);
-    /* remove the backup from the list */
-    backup_t** pbackups = &src->backups;
-    while (*pbackups != NULL) {
-        if (*pbackups == backup_res->reference) {
-            *pbackups = backup_res->reference->next;
-            break;
-        }
-        pbackups = &((*pbackups)->next);
-    };
-
-    enif_mutex_unlock(src->mutex);
-
     enif_mutex_lock(dst->mutex);
-    dst->recipient = NULL;
+    if (backup_res->reference->backup) {
+        sqlite3_backup_finish(backup_res->reference->backup);
+        backup_res->reference->backup = NULL;
+        src->source = NULL;
+        dst->destination = NULL;
+    }
     enif_mutex_unlock(dst->mutex);
-
-    backup_res->reference->backup = NULL;
+    enif_mutex_unlock(src->mutex);
     
     return am_ok;
 }
@@ -1444,17 +1483,23 @@ static ERL_NIF_TERM sqlite_backup_step_nif(ErlNifEnv *env, int argc, const ERL_N
     int step;
     if (!enif_get_int(env, argv[1], &step) || step == 0)
         return make_badarg(env, NULL, 2, "invalid step size");
-    
-    if (!backup_res->reference->backup)
-        return make_badarg(env, NULL, 1, "backup aborted (connection closed)");
 
     connection_t* src = backup_res->reference->source;
+    connection_t* dst = backup_res->reference->destination;
     enif_mutex_lock(src->mutex);
+    enif_mutex_lock(dst->mutex);
+
+    if (!backup_res->reference->backup) {
+        enif_mutex_unlock(dst->mutex);
+        enif_mutex_unlock(src->mutex);
+        return make_badarg(env, NULL, 1, "backup aborted (connection closed)");
+    }
 
     int ret = sqlite3_backup_step(backup_res->reference->backup, step);
 
     /* FIXME: add handling for SQLITE_BUSY and SQLITE_LOCKED */
     if (ret != SQLITE_OK && ret != SQLITE_DONE) {
+        enif_mutex_unlock(dst->mutex);
         enif_mutex_unlock(src->mutex);
         return make_sql_error(env, NULL, ret, -1);
     }
@@ -1462,11 +1507,41 @@ static ERL_NIF_TERM sqlite_backup_step_nif(ErlNifEnv *env, int argc, const ERL_N
     int remaining = sqlite3_backup_remaining(backup_res->reference->backup);
     int total = sqlite3_backup_pagecount(backup_res->reference->backup);
 
+    enif_mutex_unlock(dst->mutex);
     enif_mutex_unlock(src->mutex);
     return ret == SQLITE_DONE ? am_ok : 
         enif_make_tuple2(env, enif_make_int(env, remaining), enif_make_int(env, total));
 }
 
+/* Called when backup reference was not closed with backup_finish, but just lost instead. */
+static ERL_NIF_TERM sqlite_dirty_backup_finish_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    backup_finish_t* next;
+
+    /* iterate over pending connections */
+    enif_mutex_lock(s_backup_finish_mutex);
+    ASSERT(s_backup_finish_queue);
+    next = s_backup_finish_queue;
+    s_backup_finish_queue = next->next;
+    enif_mutex_unlock(s_backup_finish_mutex);
+
+    backup_t* backup = next->unfinished;
+
+    /* take src & dst mutexes */
+    enif_mutex_lock(backup->source->mutex);
+    enif_mutex_lock(backup->destination->mutex);
+    sqlite3_backup_finish(backup->backup);
+    backup->source->source = NULL;
+    backup->destination->destination = NULL;
+    enif_mutex_unlock(backup->destination->mutex);
+    enif_mutex_unlock(backup->source->mutex);
+
+    enif_release_resource(backup->source);
+    enif_release_resource(backup->destination);
+
+    enif_free(next);
+    return am_ok;
+}
 
 /* NIF Exports */
 static ErlNifFunc nif_funcs[] = {
@@ -1491,7 +1566,8 @@ static ErlNifFunc nif_funcs[] = {
     {"sqlite_backup_step_nif", 2, sqlite_backup_step_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"sqlite_backup_finish_nif", 1, sqlite_backup_finish_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
-    {"sqlite_dirty_close_nif", 0, sqlite_dirty_close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND}
+    {"sqlite_dirty_close_nif", 0, sqlite_dirty_close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sqlite_dirty_backup_finish_nif", 0, sqlite_dirty_backup_finish_nif, ERL_NIF_DIRTY_JOB_IO_BOUND}
 };
 
 
@@ -1643,6 +1719,10 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM load_info)
     ASSERT(!s_delayed_close_mutex);
     s_delayed_close_queue = NULL;
 
+    s_backup_finish_mutex = enif_mutex_create("sqlite_backup_finish");
+    ASSERT(!s_backup_finish_mutex);
+    s_backup_finish_queue = NULL;
+
     return 0;
 }
 
@@ -1650,6 +1730,7 @@ static void unload(ErlNifEnv *env, void* priv_data)
 {
     sqlite3_shutdown();
     enif_mutex_destroy(s_delayed_close_mutex);
+    enif_mutex_destroy(s_backup_finish_mutex);
 }
 
 static int upgrade(ErlNifEnv *env, void** priv_data, void** old_priv_data, ERL_NIF_TERM load_info)

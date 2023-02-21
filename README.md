@@ -100,8 +100,6 @@ escript.exe rebar3 ct
 ```
 
 ## Missing Features for 1.0
-* online backup support - as of now, too many bugs & memory leaks
-* fix memory leak when backup is aborted, or when the connection is closed
 * implement correct handling for sqlite BUSY and LOCKED return codes
 * do "trylock" and then reschedule instead of dirty NIF from the beginning
 * yielding busy handler (instead of consuming dirty I/O scheduler)
