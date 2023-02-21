@@ -149,12 +149,6 @@ nif_stub_error(Line) ->
 -type prepared_statement() :: reference().
 %% Prepared statement reference.
 
--type column_type() :: integer | float | binary.
-%% SQLite column type mapped to an Erlang type.
-
--type column_name() :: binary().
-%% Column name
-
 -type parameter() :: integer() | float() | binary() | string() | iolist() | {binary, binary()} | undefined.
 %% Erlang type allowed to be used in SQLite bindings.
 
@@ -223,7 +217,7 @@ nif_stub_error(Line) ->
 %% Backup options
 %%
 %% <ul>
-%%   <li>`from': source database name, `main' is the default</li>
+%%   <li>`from': source database name, `<<"main">>' is the default</li>
 %%   <li>`to': destination database name, takes `from' value as the default</li>
 %%   <li>`stop': backup step, pages. Default is 64</li>
 %%   <li>`progress': progress callback to invoke after finishing the next step</li>
@@ -426,7 +420,11 @@ finish(Prepared) ->
     end.
 
 %% @doc Returns column names and types for the prepared statement.
--spec describe(prepared_statement()) -> [{column_name(), column_type()}].
+%%
+%% SQLite uses dynamic type system. Types returned are column types specified
+%% in the `CREATE TABLE' statement. SQLite accepts any string as a type name,
+%% unless `STRICT' mode is used.
+-spec describe(prepared_statement()) -> [{Name :: binary(), Type :: binary()}].
 describe(Prepared) ->
     case sqlite_describe_nif(Prepared) of
         {error, Reason, ExtErr} ->
@@ -490,9 +488,10 @@ monitor(Connection) ->
             Ref
     end.
 
-%% @doc Stops monitoring previously monitored connection.
+%% @doc EXPERIMENTAL: Stops monitoring previously monitored connection.
 %%
 %% Does not flush messages that are already in transit.
+%% This API is experimental and may change in the future.
 -spec demonitor(reference()) -> ok.
 demonitor(Ref) ->
     case sqlite_monitor_nif(Ref, undefined) of
@@ -524,6 +523,7 @@ get_last_insert_rowid(Connection) ->
     sqlite_get_last_insert_rowid_nif(Connection).
 
 %% @doc Backs up the main database of the source to the destination.
+-spec backup(Source :: connection(), Destination :: connection()) -> ok.
 backup(Source, Destination) ->
     backup(Source, Destination, #{from => <<"main">>, to => <<"main">>}).
 

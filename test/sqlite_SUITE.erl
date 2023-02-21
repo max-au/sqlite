@@ -476,12 +476,12 @@ backup_sanity() ->
     [{doc, ""}].
 
 backup_sanity(Config) when is_list(Config) ->
-    %{Src0, Dst0, Backup0} = start_backup(),
-    %sqlite:close(Src0), %% must force-close the backup (causing backup to abort)
-    %{exception, error, badarg, [{sqlite, _, _, Ext} | _]} = continue_backup(Backup0),
-    %?assertEqual(#{1 => <<"backup aborted (connection closed)">>},
-    %    maps:get(cause, proplists:get_value(error_info, Ext))),
-    %sqlite:close(Dst0),
+    {Src0, Dst0, Backup0} = start_backup(),
+    sqlite:close(Src0), %% must force-close the backup (causing backup to abort)
+    {exception, error, badarg, [{sqlite, _, _, Ext} | _]} = continue_backup(Backup0),
+    ?assertEqual(#{1 => <<"backup aborted (connection closed)">>},
+        maps:get(cause, proplists:get_value(error_info, Ext))),
+    sqlite:close(Dst0),
     {Src1, Dst1, Backup1} = start_backup(),
     %% ensure that destination is locked when backup is in progress
     ?assertExtended(error, badarg, #{cause => #{1 => <<"connection busy (backup destination)">>}},

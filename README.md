@@ -100,14 +100,13 @@ escript.exe rebar3 ct
 ```
 
 ## Missing Features for 1.0
-* implement correct handling for sqlite BUSY and LOCKED return codes
-* do "trylock" and then reschedule instead of dirty NIF from the beginning
-* yielding busy handler (instead of consuming dirty I/O scheduler)
-* asynchronous `query` and `execute` APIs (with message exchange on return)
-* add diagnostic routines to enumerate prepared statements/statements running
+* performance: use "trylock" and then reschedule instead of dirty NIF from the beginning
+* performance: transparently handle BUSY and LOCKED instead of busy wait in dirty scheduler
+* asynchronous APIs (using message exchange, e.g. for `query` and `execute`)
+* diagnostic routines to enumerate prepared statements/statements running
 
 ## Features beyond 1.0
-These features did not make it into 1.0, but are useful and may be implemented
+These features will not make it into 1.0, but are useful and may be implemented
 in the following releases:
 * non-experimental sqlite hooks support (commit, preupdate, rollback, update, wal)
 * sqlite snapshot, vfs, blob and serialization support
