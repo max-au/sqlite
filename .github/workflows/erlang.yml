@@ -13,7 +13,7 @@ jobs:
     name: Erlang/OTP ${{matrix.otp}} / rebar3 ${{matrix.rebar3}}
     strategy:
       matrix:
-        otp: ['24.3.4', '25.2.1']
+        otp: ['24.3.4', '25.2.1', '26.1.2']
         rebar3: ['3.20.0']
     steps:
       - uses: actions/checkout@v3
@@ -51,3 +51,4 @@ jobs:
         run: brew install erlang rebar3
       - name: Run tests
         run: rebar3 ct
+
